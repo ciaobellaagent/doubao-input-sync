@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import socket
+from socketserver import TCPServer
 import sqlite3
 import sys
 import threading
@@ -1275,6 +1276,14 @@ class RelayHandler(BaseHTTPRequestHandler):
         return f"event: {event_name}\ndata: {data}\n\n".encode("utf-8")
 
 
+class RelayHTTPServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # HTTPServer normally reverse-resolves its address for server_name.
+        # This relay needs no machine hostname or DNS lookup to start locally.
+        TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local Doubao input sync server.")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1300,7 +1309,7 @@ def main() -> None:
     args = parser.parse_args()
     if not loopback_host(args.host) and not args.allow_remote:
         parser.error("non-loopback binding requires --allow-remote and a trusted authenticated proxy/network; room IDs are not secrets")
-    server = ThreadingHTTPServer((args.host, args.port), RelayHandler)
+    server = RelayHTTPServer((args.host, args.port), RelayHandler)
     server.public_origins = frozenset(args.public_origin)
     server.store = RoomStore(archive_idle_seconds=args.archive_idle_seconds, claim_ttl_seconds=args.claim_ttl_seconds)  # type: ignore[attr-defined]
     server.copy_store = CopyArchiveStore(args.archive_db)  # type: ignore[attr-defined]

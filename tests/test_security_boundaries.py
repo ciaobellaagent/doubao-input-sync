@@ -123,6 +123,15 @@ class RequestBoundaryTests(unittest.TestCase):
 
 
 class StartupBoundaryTests(unittest.TestCase):
+    def test_listener_starts_without_reverse_dns_or_machine_hostname(self):
+        with patch("socket.getfqdn", side_effect=AssertionError("unexpected reverse DNS")):
+            listener = server.RelayHTTPServer(("127.0.0.1", 0), server.RelayHandler)
+            try:
+                self.assertEqual(listener.server_name, "127.0.0.1")
+                self.assertGreater(listener.server_port, 0)
+            finally:
+                listener.server_close()
+
     def test_loopback_is_default_and_remote_requires_explicit_opt_in(self):
         self.assertEqual(server.build_parser().parse_args([]).host, "127.0.0.1")
         self.assertTrue(server.loopback_host("localhost"))

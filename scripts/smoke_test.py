@@ -161,7 +161,7 @@ def main() -> int:
                 sys.executable,
                 "-u",
                 "-c",
-                "import faulthandler, runpy; faulthandler.dump_traceback_later(8); runpy.run_path('app/server.py', run_name='__main__')",
+                "import faulthandler, runpy, sys; sys.path.insert(0, 'app'); faulthandler.dump_traceback_later(8); runpy.run_path('app/server.py', run_name='__main__')",
                 "--host",
                 "127.0.0.1",
                 "--port",

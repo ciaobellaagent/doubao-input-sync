@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Doubao Input Sync Pilot</title>
+    <link rel="stylesheet" href="__BASE_PATH__/assets/styles.css?v=paste-clear-261011">
+  </head>
+  <body>
+    <main class="page-shell">
+      <section class="panel hero">
+        <p class="eyebrow">Doubao Input Sync Pilot</p>
+        <h1 id="page-title">手机输入，同步到 PC</h1>
+        <p id="page-subtitle" class="subtitle"></p>
+        <div id="claim-warning" class="claim-warning" hidden></div>
+      </section>
+
+      <section class="panel grid">
+        <div class="card">
+          <label for="room-input">Room ID</label>
+          <div class="inline-row">
+            <input id="room-input" type="text" autocomplete="off">
+            <button id="reconnect-button" type="button">切换</button>
+          </div>
+          <p class="hint">手机页和 PC 页使用同一个 room 才会同步。</p>
+        </div>
+
+        <div class="card">
+          <label for="archive-idle-input">Capture Wait (seconds)</label>
+          <div class="inline-row">
+            <input id="archive-idle-input" type="number" min="0.5" step="0.1" value="2.4">
+            <button id="save-settings-button" type="button">保存</button>
+          </div>
+          <p class="hint" id="settings-status">可按输入法节奏调大或调小。</p>
+        </div>
+
+        <div class="card">
+          <label>页面底色</label>
+          <div id="theme-picker" class="theme-picker" role="radiogroup" aria-label="页面底色">
+            <button class="theme-swatch" type="button" data-theme="warm" aria-label="暖橙" title="暖橙"></button>
+            <button class="theme-swatch" type="button" data-theme="green" aria-label="青绿" title="青绿"></button>
+            <button class="theme-swatch" type="button" data-theme="blue" aria-label="蓝灰" title="蓝灰"></button>
+            <button class="theme-swatch" type="button" data-theme="rose" aria-label="玫瑰" title="玫瑰"></button>
+            <button class="theme-swatch" type="button" data-theme="slate" aria-label="深灰" title="深灰"></button>
+          </div>
+          <p class="hint" id="theme-status">同一个 room 的手机端和 PC 端会同步底色。</p>
+        </div>
+
+        <div class="card">
+          <div class="status-row">
+            <span class="status-chip" id="connection-status">连接中</span>
+            <span id="version-badge">version 0</span>
+          </div>
+          <div id="sync-flash" class="sync-flash" aria-live="polite">已捕捉并同步一批文字</div>
+          <p class="meta-line" id="updated-at">尚未收到内容</p>
+          <p class="meta-line" id="source-line">source: -</p>
+        </div>
+      </section>
+
+      <section class="panel" id="mobile-panel">
+        <div class="panel-header">
+          <h2>手机输入区</h2>
+          <a href="__BASE_PATH__/debug/latency?session=latency-261010-1500">四种方式测速</a>
+          <span class="hint" id="mobile-panel-hint">复制到手机剪贴板，再去电脑粘贴</span>
+        </div>
+        <div class="inline-row actions mobile-toolbar">
+          <button id="clear-button" type="button">清空输入框</button>
+          <button id="restore-last-button" class="secondary-button" type="button" hidden>恢复刚才内容</button>
+          <label class="toggle-label" for="auto-clear-toggle">
+            <input id="auto-clear-toggle" type="checkbox">
+            <span id="auto-clear-label">仅复制：留档后自动清空</span>
+          </label>
+          <span id="save-state" class="hint" aria-live="polite">草稿只保存在本机，点复制才会留档</span>
+        </div>
+        <div class="composer-shell" id="composer-shell" data-capture-mode="clipboard">
+          <div class="capture-mode-bar">
+            <div class="mode-switcher" role="group" aria-label="输入模式">
+              <button id="clipboard-mode-button" class="mode-option is-selected" type="button" aria-pressed="true">
+                <span>📋 粘贴</span>
+                <small>豆包同步，点一下粘贴</small>
+              </button>
+              <button id="auto-mode-button" class="mode-option" type="button" aria-pressed="false">
+                <span>⚡ 顺口</span>
+                <small>停顿后自动发</small>
+              </button>
+              <button id="manual-mode-button" class="mode-option" type="button" aria-pressed="false">
+                <span>🌿 换气</span>
+                <small>停多久都不发</small>
+              </button>
+            </div>
+            <button id="manual-send-button" class="manual-send-button" type="button" hidden>
+              说完了，发送
+            </button>
+            <div id="clipboard-buttons" class="clipboard-buttons">
+              <button id="copy-paste-button" class="manual-send-button" type="button" disabled>
+                复制并粘贴
+              </button>
+              <button id="copy-archive-button" class="secondary-button" type="button" disabled>
+                仅复制并留档
+              </button>
+            </div>
+          </div>
+          <textarea id="mobile-editor" placeholder="把豆包输入法的结果持续输入在这里"></textarea>
+          <div id="clipboard-actions" class="clipboard-actions">
+            <p class="copy-status"><strong>WorkBuddy 专项适配：</strong>目标为 WorkBuddy 时调用“编辑 → 粘贴”菜单；其他应用沿用模拟 ⌘V。</p>
+            <p id="signal-receiver-status" class="copy-status" role="status" aria-live="polite">正在检查电脑接收器…</p>
+            <p id="signal-action-status" class="copy-status" role="status" aria-live="polite">电脑光标请放在要粘贴的普通输入框中。</p>
+            <p id="copy-status" class="copy-status" role="status" aria-live="polite">先复制到手机剪贴板，留档在后台完成。</p>
+          </div>
+          <p id="capture-mode-hint" class="capture-mode-hint">说完即可点复制并粘贴；电脑未就绪时自动等最多 15 秒，匹配后粘贴。等待时修改文字会取消；执行后清空，失败或超时保留，可切换换气发送。</p>
+        </div>
+      </section>
+
+      <section class="panel" id="pc-panel">
+        <div class="panel-header">
+          <h2>PC 同步区</h2>
+          <span class="hint" id="pc-panel-hint">最新留档可直接复制</span>
+        </div>
+        <div id="pc-output" class="output-box">等待手机端输入…</div>
+        <div class="inline-row actions">
+          <button id="copy-button" type="button">复制到剪贴板</button>
+          <button id="refresh-button" type="button">刷新状态</button>
+        </div>
+      </section>
+
+      <section class="panel" id="copy-history-panel">
+        <div class="panel-header">
+          <h2>复制留档</h2>
+          <div class="inline-row">
+            <button id="copy-history-refresh-button" class="secondary-button" type="button">刷新留档</button>
+            <button id="retry-copy-archive-button" class="secondary-button" type="button" hidden>重试留档</button>
+          </div>
+        </div>
+        <p id="copy-queue-status" class="hint" role="status" aria-live="polite">点过复制的文字会保存在这里，可随时重新复制。</p>
+        <div id="copy-history-list" class="history-list">
+          <div class="history-empty">正在读取复制留档…</div>
+        </div>
+      </section>
+
+      <section class="panel" id="history-panel">
+        <div class="panel-header">
+          <h2>发送存档列表</h2>
+          <span class="hint" id="archive-hint">输入停顿后自动入档</span>
+        </div>
+        <div id="history-list" class="history-list">
+          <div class="history-empty">还没有归档内容。</div>
+        </div>
+        <p class="hint">
+          如果你要直接灌进当前激活输入框，可在本机另开：
+          <code>python3 scripts/mac_paste_helper.py --mode paste</code>
+        </p>
+      </section>
+    </main>
+
+    <script>window.__APP_BASE_PATH__ = "__BASE_PATH__";</script>
+    <script src="__BASE_PATH__/assets/client.js?v=verified-paste-261012"></script>
+  </body>
+</html>

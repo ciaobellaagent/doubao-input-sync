@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#f5f2eb">
+    <title>复制，然后粘贴 · Doubao Input Sync</title>
+    <link rel="stylesheet" href="__BASE_PATH__/assets/signal-trial.css">
+    <script>window.__APP_BASE_PATH__ = "__BASE_PATH__";</script>
+    <script src="__BASE_PATH__/assets/signal-trial.js" defer></script>
+  </head>
+  <body>
+    <main class="page">
+      <header class="masthead">
+        <span class="wordmark">DOUBAO <span>INPUT SYNC</span></span>
+        <span class="trial-tag">信号方案 · 试用</span>
+      </header>
+      <section class="intro" aria-labelledby="page-title">
+        <p class="eyebrow">手机 → 电脑</p>
+        <h1 id="page-title">在手机写，<br>到电脑贴。</h1>
+        <p class="lede">豆包同步文字，我们发出粘贴指令。<br>每次复制，也为你留一份档。</p>
+      </section>
+      <section class="composer" aria-label="输入与复制">
+        <div class="editor-heading">
+          <label for="draft">这次想写什么</label>
+          <span id="character-count">0 字</span>
+        </div>
+        <textarea id="draft" rows="7" placeholder="在这里用豆包输入……" spellcheck="false" aria-describedby="draft-hint"></textarea>
+        <p id="draft-hint" class="draft-hint">草稿保存在这台手机，复制后继续保留。</p>
+        <div id="receiver-status" class="receiver-status" data-tone="waiting" role="status">正在连接电脑…</div>
+        <button id="copy-paste" class="primary" type="button" disabled>复制并粘贴到电脑 <span aria-hidden="true">↗</span></button>
+        <p class="focus-hint">电脑先点进「文本编辑」或「备忘录」的正文输入处，再点按钮。</p>
+        <button id="copy-only" class="secondary" type="button" disabled>仅复制并留档</button>
+      </section>
+      <section class="receipts" aria-label="本次进度" aria-live="polite" aria-atomic="false">
+        <div class="receipt"><span class="receipt-label">粘贴</span><p id="action-status">等待你复制</p></div>
+        <div class="receipt"><span class="receipt-label">留档</span><p id="archive-status">复制后自动保存</p></div>
+      </section>
+      <p class="trial-note">试用期间，电脑收到指令后会等半秒再粘贴。这不能保证豆包已同步完成，请核对电脑上实际贴出的文字。页面不会自动重发粘贴指令。</p>
+      <footer>DOUBAO INPUT SYNC <span>少一步，接着写。</span></footer>
+    </main>
+  </body>
+</html>

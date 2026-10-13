@@ -1,0 +1,30 @@
+name: Source and release checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Python regression tests
+        run: python3 -m unittest discover -s tests
+      - name: Browser logic tests
+        run: node --test tests/test_client_clipboard.js tests/test_signal_trial_client.js
+      - name: JavaScript syntax
+        run: |
+          node --check app/static/client.js
+          node --check app/static/signal-trial.js
+      - name: Public tree and history hygiene
+        run: python3 scripts/check_public_release.py --history
+      - name: Native pure checks (no desktop events)
+        run: |
+          swiftc -O scripts/workbuddy_paste.swift -o "$RUNNER_TEMP/workbuddy-paste"
+          "$RUNNER_TEMP/workbuddy-paste" --self-test
+      - name: Isolated server smoke tests
+        run: |
+          python3 scripts/smoke_test.py --room-id ci-root --output-json "$RUNNER_TEMP/root.json"
+          python3 scripts/smoke_test.py --room-id ci-subpath --base-path /doubao --output-json "$RUNNER_TEMP/subpath.json"

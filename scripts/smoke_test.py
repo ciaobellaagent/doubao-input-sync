@@ -15,7 +15,10 @@ from pathlib import Path
 from typing import Dict, List
 from urllib.error import HTTPError
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
+
+# Isolated loopback fixtures must never depend on a workstation/CI proxy.
+urlopen = build_opener(ProxyHandler({})).open
 
 import mac_paste_helper
 
@@ -31,6 +34,7 @@ def find_free_port() -> int:
 
 def wait_for_ping(server_url: str, timeout_seconds: float = 10, server_process=None) -> None:
     deadline = time.time() + timeout_seconds
+    last_error = "no response"
     while time.time() < deadline:
         if server_process is not None and server_process.poll() is not None:
             raise RuntimeError(f"local relay exited before readiness: {server_process.returncode}")
@@ -39,9 +43,10 @@ def wait_for_ping(server_url: str, timeout_seconds: float = 10, server_process=N
                 payload = json.loads(response.read().decode("utf-8"))
             if payload.get("ok"):
                 return
-        except Exception:
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
             time.sleep(0.2)
-    raise RuntimeError("server failed to answer /api/ping before timeout")
+    raise RuntimeError(f"server failed to answer /api/ping before timeout ({last_error})")
 
 
 def read_sse_event(server_url: str, room_id: str, results: List[Dict[str, object]], stop_after: int = 2) -> None:
@@ -154,6 +159,7 @@ def main() -> int:
         with server_log.open("w", encoding="utf-8") as server_handle:
             server_args = [
                 sys.executable,
+                "-u",
                 "app/server.py",
                 "--host",
                 "127.0.0.1",
@@ -166,8 +172,7 @@ def main() -> int:
                 "--archive-db",
                 str(temp_path / "archives.sqlite3"),
             ]
-            if args.base_path:
-                server_args.extend(["--base-path", args.base_path])
+            server_args.extend(["--base-path", args.base_path])
             server_proc = subprocess.Popen(
                 server_args,
                 cwd=PROJECT_ROOT,

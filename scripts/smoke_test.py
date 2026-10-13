@@ -29,9 +29,11 @@ def find_free_port() -> int:
         return sock.getsockname()[1]
 
 
-def wait_for_ping(server_url: str, timeout_seconds: float = 10) -> None:
+def wait_for_ping(server_url: str, timeout_seconds: float = 10, server_process=None) -> None:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
+        if server_process is not None and server_process.poll() is not None:
+            raise RuntimeError(f"local relay exited before readiness: {server_process.returncode}")
         try:
             with urlopen(f"{server_url}/api/ping", timeout=1) as response:
                 payload = json.loads(response.read().decode("utf-8"))
@@ -174,7 +176,7 @@ def main() -> int:
             )
 
         try:
-            wait_for_ping(server_url)
+            wait_for_ping(server_url, server_process=server_proc)
 
             sse_events: List[Dict[str, object]] = []
             sse_thread = threading.Thread(
@@ -311,6 +313,10 @@ def main() -> int:
 
             Path(args.output_json).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             return 0
+        except Exception:
+            # This disposable server only processes synthetic smoke-test data.
+            sys.stderr.write("Local smoke-test relay output:\n" + server_log.read_text()[-4000:] + "\n")
+            raise
         finally:
             server_proc.terminate()
             try:

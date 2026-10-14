@@ -66,6 +66,7 @@ function boot(options = {}) {
   elements.get('archive-idle-input').value = '2.4';
   doc = {
     body: new Element('body'), activeElement: null, visibilityState: 'visible',
+    documentElement: { getAttribute: name => name === 'data-app-base-path' && !options.legacyBasePath ? options.basePath || '' : null },
     getElementById: id => elements.get(id), createElement: () => new Element(),
     addEventListener: (name, cb) => listeners.set(`document:${name}`, cb),
     execCommand: () => true,
@@ -139,7 +140,7 @@ function boot(options = {}) {
     return response({ ok: true });
   };
   const window = {
-    __APP_BASE_PATH__: options.basePath || '', location: { pathname: `${options.basePath || ''}/${options.role || 'mobile'}/${encodeURIComponent(options.room || 'room')}` },
+    __APP_BASE_PATH__: options.blockInline ? undefined : options.basePath || '', location: { pathname: `${options.basePath || ''}/${options.role || 'mobile'}/${encodeURIComponent(options.room || 'room')}` },
     localStorage, isSecureContext: options.secure !== false, crypto: { randomUUID, subtle: { digest: async (algorithm, bytes) => Uint8Array.from(createHash("sha256").update(bytes).digest()).buffer } }, confirm: () => true,
     setTimeout: (fn, delay) => { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
     clearTimeout: id => timers.delete(id),
@@ -148,7 +149,7 @@ function boot(options = {}) {
     addEventListener: (name, cb) => listeners.set(name, cb),
   };
   class EventSource {
-    constructor(url) { this.url = url; this.events = new Map(); streams.push(this); }
+    constructor(url) { if (options.streamFailure) throw new Error('stream blocked'); this.url = url; this.events = new Map(); streams.push(this); }
     addEventListener(name, cb) { this.events.set(name, cb); }
     close() {}
   }
@@ -503,6 +504,58 @@ test('PC /doubao/pc/air immediately reads durable copies even when relay state f
   assert.equal(env.get('copy-history-list').children.length, 1);
   assert.equal(env.get('copy-button').disabled, false);
   assert.equal(signals(env).length, 0);
+});
+
+test('PC reads copies when stream construction is blocked and keeps refreshing', async () => {
+  const env = boot({ role: 'pc', basePath: '/doubao', room: 'air', streamFailure: true,
+    archives: [{ copy_id: 'saved', text: '已保存的样本', copied_at: '2026-10-14T01:00:00Z' }] });
+  await settle();
+  assert.equal(env.get('pc-output').textContent, '已保存的样本');
+  assert.match(env.get('connection-status').textContent, /自动刷新/);
+  env.archived.push({ copy_id: 'next', text: '之后保存的样本', copied_at: '2026-10-14T02:00:00Z' });
+  await env.tick(15000);
+  assert.equal(env.get('pc-output').textContent, '之后保存的样本');
+});
+
+test('PC subpath works without inline configuration in both new and cached HTML', async () => {
+  for (const legacyBasePath of [false, true]) {
+    const env = boot({ role: 'pc', basePath: '/doubao', room: 'air', blockInline: true, legacyBasePath,
+      archives: [{ copy_id: 'saved', text: '子路径留档样本', copied_at: '2026-10-14T01:00:00Z' }] });
+    await settle();
+    assert.equal(env.get('mobile-panel').hidden, true);
+    assert.equal(env.get('pc-output').textContent, '子路径留档样本');
+    assert.ok(env.calls.some(c => c.url === '/doubao/api/copy-history?room_id=air'));
+    assert.ok(env.calls.filter(c => c.kind === 'fetch').every(c => c.endpoint.startsWith('/doubao/api/')));
+  }
+  assert.doesNotMatch(html, /<script>window\.__APP_BASE_PATH__/);
+});
+
+test('PC shows saved copies before sending, across all modes, without masking a sent archive', async () => {
+  const archives = Array.from({ length: 50 }, (_, index) => ({ copy_id: `sample-${index}`, text: `合成留档 ${index}`, copied_at: `2026-10-14T01:00:${String(index).padStart(2, '0')}Z` }));
+  for (const mode of ['clipboard', 'manual', 'auto']) {
+    const env = boot({ role: 'pc', mode, archives }); await settle();
+    assert.equal(env.get('copy-history-list').children.length, 50);
+    assert.equal(env.get('pc-output').textContent, '合成留档 49');
+    if (mode !== 'clipboard') {
+      env.emit({ ...env.server, version: 1, history: [{ archive_id: 1, text: '明确发送的样本', archived_at: '2026-10-14T02:00:00Z' }] });
+      assert.equal(env.get('pc-output').textContent, '明确发送的样本');
+      await env.tick(15000);
+      assert.equal(env.get('pc-output').textContent, '明确发送的样本');
+    }
+  }
+});
+
+test('PC can copy the first sent archive after an empty copy-history response', async () => {
+  for (const mode of ['manual', 'auto']) {
+    const env = boot({ role: 'pc', mode, archives: [] }); await settle();
+    assert.equal(env.get('copy-button').disabled, true);
+    env.emit({ ...env.server, version: 1, history: [{ archive_id: 1, text: '第一条发送样本', archived_at: '2026-10-14T02:00:00Z' }] });
+    assert.equal(env.get('pc-output').textContent, '第一条发送样本');
+    assert.equal(env.get('copy-button').disabled, false);
+    assert.match(env.get('pc-panel-hint').textContent, /最新发送留档/);
+    env.click('copy-button'); await settle();
+    assert.equal(env.calls.filter(c => c.kind === 'clipboard').at(-1).text, '第一条发送样本');
+  }
 });
 
 test('PC refresh retrieves new copies and later relay state cannot hide latest copy', async () => {

@@ -41,6 +41,7 @@
     copyHistoryGeneration: 0,
     copyHistoryLoaded: false,
     copyHistoryError: false,
+    pcRelayArchive: null,
     signalReady: false,
     signalSessionId: null,
     signalPolling: false,
@@ -60,7 +61,11 @@
     serverEpoch: null,
     retiredServerEpochs: new Set(),
   };
-  const basePath = (window.__APP_BASE_PATH__ || "").replace(/\/+$/, "");
+  // The page must also work when a gateway blocks inline scripts. New HTML
+  // carries this as data; the pathname fallback supports older cached HTML.
+  const htmlBasePath = document.documentElement && document.documentElement.getAttribute("data-app-base-path");
+  const routedPath = window.location.pathname.match(/^(.*)\/(?:mobile|pc)\/[^/]+\/?$/);
+  const basePath = (htmlBasePath || window.__APP_BASE_PATH__ || (routedPath && routedPath[1]) || "").replace(/\/+$/, "");
 
   const roomInput = document.getElementById("room-input");
   const reconnectButton = document.getElementById("reconnect-button");
@@ -667,17 +672,35 @@
     return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString("zh-CN", { hour12: false });
   }
 
-  function renderPcClipboardOutput() {
-    if (state.role !== "pc" || state.captureMode !== "clipboard") return;
+  function renderPcOutput() {
+    if (state.role !== "pc") return;
+    // A mode switch does not remove durable copies. If this sending mode has
+    // no relay archive yet, keep the saved copy available in the main PC box.
+    if (state.captureMode !== "clipboard" && state.pcRelayArchive) {
+      pcPanelHint.textContent = `房间 ${state.roomId} · 最新发送留档`;
+      output.textContent = state.pcRelayArchive.text || "";
+      copyButton.disabled = clipboardBusy() || !output.textContent;
+      versionBadge.textContent = `version ${state.lastVersion}`;
+      updatedAt.textContent = `发送时间：${displayCopyTime(state.pcRelayArchive.archived_at)}`;
+      sourceLine.textContent = `当前房间：${state.roomId}`;
+      return;
+    }
     const latest = state.copyHistory.slice().sort(function (left, right) {
       return String(right.copied_at || right.archived_at || "").localeCompare(String(left.copied_at || left.archived_at || ""));
     })[0];
-    pcPanelHint.textContent = "剪贴板模式 · 最新复制留档";
+    pcPanelHint.textContent = state.captureMode === "clipboard"
+      ? `房间 ${state.roomId} · 最新复制留档`
+      : `房间 ${state.roomId} · 最新复制留档（尚无发送留档）`;
     output.textContent = latest ? latest.text
       : state.copyHistoryError ? "复制留档暂未读到，请点“刷新留档”重试。"
-      : state.copyHistoryLoaded ? "这个 room 还没有复制留档。"
+      : state.copyHistoryLoaded ? `房间 ${state.roomId} 还没有复制留档。请确认与手机页使用同一个房间。`
       : "正在读取复制留档…";
     copyButton.disabled = clipboardBusy() || !latest;
+    if (latest) {
+      versionBadge.textContent = `最近 ${state.copyHistory.length} 条复制留档`;
+      updatedAt.textContent = `留档时间：${displayCopyTime(latest.archived_at || latest.copied_at)}`;
+      sourceLine.textContent = `当前房间：${state.roomId}`;
+    }
   }
 
   function renderCopyHistory() {
@@ -744,7 +767,7 @@
     } else if (!state.copyHistoryLoaded && !state.copyOutbox.length) {
       copyQueueStatus.textContent = "正在读取这个 room 的复制留档…";
     }
-    renderPcClipboardOutput();
+    renderPcOutput();
   }
 
   async function fetchCopyHistory() {
@@ -1073,7 +1096,7 @@
       list.querySelectorAll("[data-clipboard-copy]").forEach(function (button) { button.disabled = clipboardBusy(); });
     });
     updateRecoveryAvailability();
-    renderPcClipboardOutput();
+    renderPcOutput();
   }
 
   function renderCaptureMode(mode) {
@@ -1206,6 +1229,7 @@
     const previousVersion = state.lastVersion;
     const nextHistoryCount = (payload.history || []).length;
     const latestArchive = nextHistoryCount ? payload.history[nextHistoryCount - 1] : null;
+    state.pcRelayArchive = latestArchive;
     const latestArchiveId = latestArchive ? latestArchive.archive_id : 0;
     const sawNewArchive = latestArchiveId > state.lastArchiveId;
     const shouldClearFromServerState =
@@ -1232,7 +1256,7 @@
       } else {
         output.textContent = "等待手机端输入…";
       }
-      renderPcClipboardOutput();
+      renderPcOutput();
     }
     if (state.role === "mobile" && !state.mobileHydrated && document.activeElement !== mobileEditor && state.captureMode !== "clipboard" && !state.modeChangePending) {
       mobileEditor.value = payload.text || "";
@@ -1821,7 +1845,16 @@
     }
 
     connectionStatus.textContent = "连接中";
-    const eventSource = new EventSource(appPath(`/api/stream?room_id=${encodeURIComponent(state.roomId)}`));
+    let eventSource;
+    try {
+      eventSource = new EventSource(appPath(`/api/stream?room_id=${encodeURIComponent(state.roomId)}`));
+    } catch (error) {
+      state.eventSource = null;
+      connectionStatus.textContent = "实时连接不可用，自动刷新中";
+      ensurePolling();
+      startClaimHeartbeat();
+      return;
+    }
     state.eventSource = eventSource;
 
     eventSource.addEventListener("open", function () {
@@ -2012,8 +2045,10 @@
   fetchState().catch(function () { connectionStatus.textContent = "未连接；本机复制仍可使用"; });
   fetchServerInfo().catch(function () {});
   claimCurrentRole();
+  // Saved copies are independent of receiver/stream support. Start their read
+  // before the optional stream so browser policy cannot block PC history.
+  fetchCopyHistory().catch(function () {});
   connectStream();
   restartCopyArchiveRetry();
-  fetchCopyHistory().catch(function () {});
   void pollSignalStatus();
 })();

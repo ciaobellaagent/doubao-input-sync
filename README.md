@@ -35,6 +35,16 @@ Open these on the same computer:
 
 `demo` is an example room, not a credential. This loopback URL is not reachable from a phone. For phone access, configure your own protected HTTPS endpoint and its exact origin using `--public-origin`; instructions and checks are in [Operations](docs/OPERATIONS.md). Non-loopback binding requires an explicit `--allow-remote`.
 
+## Retrieve saved text on the desktop
+
+Use the same room on the phone and desktop, such as `/mobile/demo` and `/pc/demo`. After a phone copy is successfully archived, its text appears in the desktop page's copy-history list. The list shows the latest 50 records; older records remain in the database.
+
+The desktop page reads archives on opening, without needing an automatic-paste receiver. It refreshes every 15 seconds while visible and when you return to the page. Use **Refresh archives** for an immediate read. A failed read offers a retry and preserves records already displayed.
+
+In Clipboard mode, the main desktop box shows the latest saved copy. Breathing and Flow modes also show it until a sent record exists; then the main box shows the latest sent text, while the copy-history list remains available below. The page identifies the room and record time to help confirm pairing.
+
+Use **Copy again** on a record to put its text on this computer's clipboard, then paste it where needed. This does not create another archive or request automatic paste. See [clipboard and archive details](docs/CLIPBOARD_ARCHIVE.md#desktop-history).
+
 ## Phone clipboard → Mac paste
 
 1. Set up protected phone access and confirm that the phone's copy button triggers your input method's cross-device clipboard sync.

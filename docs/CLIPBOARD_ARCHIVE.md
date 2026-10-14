@@ -18,6 +18,16 @@ After dispatch, the page observes the result separately for up to 15 seconds. Th
 
 The native receiver route verifies inserted text. The ordinary System Events route confirms only key dispatch. A missing or failed confirmation does not prove that no insertion occurred. Check the target before retrying or sending the same text through Breathing mode.
 
+## Desktop history
+
+Open `/pc/<room>` with the same room as the phone's `/mobile/<room>`. Copy history loads independently of relay state, receiver readiness and streaming support. The page starts the archive request before opening the optional event stream. If stream construction is blocked or unsupported, relay state falls back to polling and archive reads continue.
+
+The desktop copy list is available in every input mode. The main box shows the latest copy in Clipboard mode, and also in Breathing or Flow mode before any sent archive exists. Once a sent archive exists in a sending mode, the main box and its copy button use that record; the saved-copy list remains available below. The room, record time and copy-list count make the displayed source explicit.
+
+While visible, the page refreshes copy history every 15 seconds; returning to the page or clicking the archive refresh button also requests it. A failed read does not erase previously displayed records. **Copy again** writes only to the desktop clipboard, without creating another copy archive or requesting a paste.
+
+For subpath deployments, the rendered HTML carries the base path in a data attribute. The client also recognizes the `/mobile/<room>` or `/pc/<room>` route in older HTML. Archive requests therefore do not require an inline configuration script, which an HTTPS gateway's content security policy may block. HTML references a versioned client asset so a page refresh requests the updated code.
+
 ## Storage
 
 `POST /api/copy-archive` stores `{room_id, copy_id, text, copied_at}` in SQLite and returns success only after commit. `GET /api/copy-history?room_id=…` reads copy records. Copy archives are separate from transient relay delivery history.

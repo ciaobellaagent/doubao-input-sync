@@ -2,33 +2,54 @@ use framework "AppKit"
 use framework "Foundation"
 use scripting additions
 
+property diagnosticTraceId : ""
+property diagnosticCount : 0
+property diagnosticCapturePending : true
+property diagnosticLegacyStarted : false
+
 -- Only the explicitly authorized action starts this process. The body never
 -- travels in argv or stdout. This path never writes the pasteboard.
 on run argv
     set deadlineMs to (item 1 of argv) as real
     set expectedHash to item 2 of argv
     set diagnosticStage to "start"
+    set diagnosticTraceId to current application's NSUUID's UUID()'s UUIDString()'s lowercaseString() as text
+    set diagnosticCount to 0
+    set diagnosticCapturePending to true
+    set diagnosticLegacyStarted to false
+    set incomingTraceId to current application's NSProcessInfo's processInfo()'s environment()'s objectForKey:"DOUBAO_PASTE_TRACE_ID"
+    if incomingTraceId is not missing value then
+        set parsedId to current application's NSUUID's alloc()'s initWithUUIDString:incomingTraceId
+        if parsedId is not missing value then set diagnosticTraceId to parsedId's UUIDString()'s lowercaseString() as text
+    end if
     try
         if my nowMs() ≥ deadlineMs then return "expired"
         tell application "System Events"
             set diagnosticStage to "target_process"
             set targetPid to my frontmostPid()
+            my progress("as_start", 0)
             my recordFailure("workspace_target_pid", targetPid)
+            my progress("as_legacy_lookup", 0)
             try
                 set legacyPid to unix id of first application process whose frontmost is true
                 if legacyPid is not targetPid then my recordFailure("system_events_disagrees_pid", legacyPid)
             end try
+            my progress("as_process_lookup", 0)
             set targetProcess to first application process whose unix id is targetPid
+            my progress("as_bundle_lookup", 0)
             if (bundle identifier of targetProcess) is "com.tencent.workbuddy.mac" then
                 set diagnosticStage to "native_workbuddy"
                 return my pasteNative(deadlineMs, expectedHash, targetPid)
             end if
             try
                 set diagnosticStage to "focused_input"
+                my progress("as_focused_input", 0)
                 set initialField to value of attribute "AXFocusedUIElement" of targetProcess
                 set diagnosticStage to "focused_window"
+                my progress("as_focused_window", 0)
                 set initialWindow to value of attribute "AXFocusedWindow" of targetProcess
                 set diagnosticStage to "input_role"
+                my progress("as_input_role", 0)
                 set fieldRole to value of attribute "AXRole" of initialField
                 set safetyResult to my fieldSafety(initialField)
             on error lookupText number lookupCode
@@ -53,8 +74,11 @@ on run argv
             end if
             if safetyResult is not "ready" then return safetyResult
         end tell
+        set diagnosticCapturePending to false
+        my progress("as_focus_ready", 0)
         set diagnosticStage to "modifiers"
         if my modifiersHeld() then return "modifier_held"
+        my progress("as_clipboard_wait", 0)
         repeat
             if my nowMs() ≥ deadlineMs then return "clipboard_timeout"
             set diagnosticStage to "focus_recheck"
@@ -74,7 +98,11 @@ on run argv
             set diagnosticStage to "clipboard_hash"
             set hashLine to do shell script "LC_ALL=en_US.UTF-8 /usr/bin/pbpaste | /usr/bin/shasum -a 256"
             if (text 1 thru 64 of hashLine) is expectedHash then
+                my progress("as_clipboard_matched", 0)
                 if not my exactClipboard(localText, beforeChange) then return "clipboard_changed"
+                -- Intent does not prove dispatch. All final safety checks run
+                -- after the diagnostic write, including the exact field/window.
+                my progress("as_dispatch_intent", 0)
                 tell application "System Events"
                     set currentPid to my frontmostPid()
                     if currentPid is not targetPid then return "focus_changed"
@@ -93,6 +121,7 @@ on run argv
                     if my nowMs() ≥ deadlineMs then return "expired"
                     set diagnosticStage to "key_dispatch"
                     keystroke "v" using command down
+                    my progress("as_dispatch_returned", 0)
                 end tell
                 return "executed"
             end if
@@ -131,21 +160,102 @@ on modifiersHeld()
     return false
 end modifiersHeld
 
--- Each action loads this script afresh. Keep bounded diagnostics available even
--- to an already-running receiver; never record error text, field values or body.
+-- Each action reloads this script, including on legacy running receivers.
+-- New receivers filter a dedicated stderr pipe. Legacy receivers get bounded
+-- local phase logs with a diagnostic UUID (not the unavailable server action ID).
 on recordFailure(stageName, errorCode)
-    try
-        set logDirectory to (current application's NSHomeDirectory() as text) & "/Library/Logs/DoubaoInputSync"
-        set logPath to logDirectory & "/native-errors.log"
-        set diagnosticLine to (my nowMs() as text) & "|" & stageName & "|" & (errorCode as text)
-        do shell script "umask 077; /bin/mkdir -p " & quoted form of logDirectory & "; /usr/bin/printf '%s\\n' " & quoted form of diagnosticLine & " >> " & quoted form of logPath
-    end try
+    -- Preserve existing failure/PID records on a legacy receiver. Added initial
+    -- phase records stay pipe-only until the original field/window is captured.
+    if my traceEnabled() then
+        my progress(stageName, errorCode)
+    else
+        my legacyProgress(stageName, errorCode)
+    end if
 end recordFailure
+
+on traceEnabled()
+    try
+        set flagValue to current application's NSProcessInfo's processInfo()'s environment()'s objectForKey:"DOUBAO_PASTE_TRACE"
+        if flagValue is missing value then return false
+        return (flagValue as text) is "1"
+    on error
+        return false
+    end try
+end traceEnabled
+
+on progress(stageName, errorCode)
+    try
+        if diagnosticCount ≥ 64 then return
+        set diagnosticCount to diagnosticCount + 1
+        if my traceEnabled() then
+            set diagnosticLine to "DOUBAO_TRACE|" & stageName & "|" & (errorCode as text) & linefeed
+            set diagnosticData to (current application's NSString's stringWithString:diagnosticLine)'s dataUsingEncoding:(current application's NSUTF8StringEncoding)
+            current application's NSFileHandle's fileHandleWithStandardError()'s writeData:diagnosticData
+        else
+            if diagnosticCapturePending then return
+            my legacyProgress(stageName, errorCode)
+        end if
+    end try
+end progress
+
+on legacyProgress(stageName, errorCode)
+    try
+        set fm to current application's NSFileManager's defaultManager()
+        set logDirectory to (current application's NSHomeDirectory() as text) & "/Library/Logs/DoubaoInputSync"
+        set permissions to current application's NSDictionary's dictionaryWithObject:448 forKey:(current application's NSFilePosixPermissions)
+        fm's createDirectoryAtPath:logDirectory withIntermediateDirectories:true attributes:permissions |error|:(missing value)
+        set logPath to logDirectory & "/native-errors.log"
+        -- Rotate once at the first phase, reserving room for this bounded action.
+        -- Reject special files/links; diagnostic failure never changes the result.
+        repeat with suffix in {"", ".1", ".2"}
+            set candidate to logPath & suffix
+            if (fm's fileExistsAtPath:candidate) as boolean then
+                set attrs to fm's attributesOfItemAtPath:candidate |error|:(missing value)
+                if (attrs's objectForKey:(current application's NSFileType)) as text is not (current application's NSFileTypeRegular as text) then return
+                if (attrs's objectForKey:(current application's NSFileSize)) as real > 2097152 then
+                    set oversizedHandle to current application's NSFileHandle's fileHandleForWritingAtPath:candidate
+                    if oversizedHandle is missing value then return
+                    oversizedHandle's truncateFileAtOffset:0
+                    oversizedHandle's closeFile()
+                end if
+            end if
+        end repeat
+        if not diagnosticLegacyStarted and (fm's fileExistsAtPath:logPath) as boolean then
+            set attrs to fm's attributesOfItemAtPath:logPath |error|:(missing value)
+            if (attrs's objectForKey:(current application's NSFileSize)) as real > 2080768 then
+                fm's removeItemAtPath:(logPath & ".2") |error|:(missing value)
+                if (fm's fileExistsAtPath:(logPath & ".1")) as boolean then
+                    if not (fm's moveItemAtPath:(logPath & ".1") toPath:(logPath & ".2") |error|:(missing value)) as boolean then return
+                end if
+                if not (fm's moveItemAtPath:logPath toPath:(logPath & ".1") |error|:(missing value)) as boolean then return
+            end if
+        end if
+        set diagnosticLegacyStarted to true
+        if not (fm's fileExistsAtPath:logPath) as boolean then
+            set filePermissions to current application's NSDictionary's dictionaryWithObject:384 forKey:(current application's NSFilePosixPermissions)
+            if not (fm's createFileAtPath:logPath |contents|:(missing value) attributes:filePermissions) as boolean then return
+        end if
+        set diagnosticLine to (my nowMs() as text) & "|" & stageName & "|" & (errorCode as text) & "|" & diagnosticTraceId & linefeed
+        set diagnosticData to (current application's NSString's stringWithString:diagnosticLine)'s dataUsingEncoding:(current application's NSUTF8StringEncoding)
+        set handle to current application's NSFileHandle's fileHandleForWritingAtPath:logPath
+        if handle is missing value then return
+        set currentSize to handle's seekToEndOfFile()
+        if (currentSize as real) + (diagnosticData's |length|() as real) > 2097152 then
+            handle's closeFile()
+            return
+        end if
+        handle's writeData:diagnosticData
+        handle's closeFile()
+    end try
+end legacyProgress
 
 on pasteNative(deadlineMs, expectedHash, targetPid)
     set nativePath to (current application's NSHomeDirectory() as text) & "/Library/Application Support/DoubaoInputSync/native/workbuddy-paste"
     set ownerPid to current application's NSProcessInfo's processInfo()'s processIdentifier() as integer
-    return do shell script quoted form of nativePath & " " & quoted form of (deadlineMs as text) & " " & quoted form of expectedHash & " " & (ownerPid as text) & " " & (targetPid as text)
+    my progress("as_native_handoff", 0)
+    set nativeCommand to quoted form of nativePath
+    if diagnosticTraceId is not "" then set nativeCommand to "DOUBAO_PASTE_TRACE_ID=" & quoted form of diagnosticTraceId & " " & nativeCommand
+    return do shell script nativeCommand & " " & quoted form of (deadlineMs as text) & " " & quoted form of expectedHash & " " & (ownerPid as text) & " " & (targetPid as text)
 end pasteNative
 
 on frontmostPid()

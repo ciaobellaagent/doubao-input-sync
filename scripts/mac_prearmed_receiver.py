@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import select
 import subprocess
 import threading
 import time
@@ -22,6 +23,7 @@ from urllib.parse import urlencode
 
 from mac_signal_trial import Api, ApiError, REASONS, emit, exclusive_trial, uuid_string
 import mac_paste_helper as relay
+from paste_diagnostics import action_context, current_action_id, trace, STAGES, enable as enable_diagnostics
 
 HERE = Path(__file__).resolve().parent
 PROTOCOL = "clipboard-match-v1"
@@ -69,19 +71,34 @@ class ControlApi(Api):
         if payload is not None:
             command += ["-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-"]
             body = json.dumps(payload)
-        result = subprocess.run(command + [url], input=body, text=True, capture_output=True,
-                                timeout=self.request_timeout + 1)
-        if result.returncode:
-            raise ApiError("transport_failed")
+        started = time.monotonic()
+        diagnostic = {"endpoint": name, "outcome": "ok"}
         try:
-            data, code = result.stdout.rsplit("\n", 1)
-            data = json.loads(data)
-            code = int(code)
-            if code not in {200, 201, 202} or not isinstance(data, dict) or data.get("ok") is False:
-                raise ControlApiError(code, data.get("error") if isinstance(data, dict) else None)
-            return data
-        except (ValueError, TypeError) as exc:
-            raise ApiError("invalid_response") from exc
+            result = subprocess.run(command + [url], input=body, text=True, capture_output=True,
+                                    timeout=self.request_timeout + 1)
+            if result.returncode:
+                diagnostic.update(outcome="transport_failed", curl_code=result.returncode)
+                raise ApiError("transport_failed")
+            try:
+                data, code = result.stdout.rsplit("\n", 1)
+                code = int(code)
+                diagnostic["http_status"] = code
+                data = json.loads(data)
+                if code not in {200, 201, 202} or not isinstance(data, dict) or data.get("ok") is False:
+                    error = ControlApiError(code, data.get("error") if isinstance(data, dict) else None)
+                    diagnostic.update(outcome="http_error", error_code=error.error_code)
+                    raise error
+                return data
+            except (ValueError, TypeError) as exc:
+                diagnostic["outcome"] = "invalid_response"
+                raise ApiError("invalid_response") from exc
+        except subprocess.TimeoutExpired:
+            diagnostic["outcome"] = "process_timeout"
+            raise
+        finally:
+            # Quiet idle polls do not fill the ring. Errors and all ACKs do.
+            if name != "poll" or diagnostic["outcome"] != "ok":
+                trace("control", elapsed_ms=(time.monotonic() - started) * 1000, **diagnostic)
 
 
 def valid_hash(value):
@@ -156,31 +173,100 @@ def native_result(output, returncode):
     return "paste_failed"
 
 
+class NativeProgress:
+    """Drain stderr without retaining arbitrary OS/app error text.
+
+    Only fixed markers emitted by our adapters reach the structured log. Even
+    oversized/unterminated or binary stderr is discarded, never persisted.
+    """
+    def __init__(self):
+        self.buffer = b""
+        self.discarding = False
+        self.events = 0
+
+    def feed(self, data):
+        for part in data.splitlines(keepends=True):
+            ended = part.endswith(b"\n")
+            if not self.discarding and len(self.buffer) + len(part) <= 256:
+                self.buffer += part
+            else:
+                self.discarding = True
+                self.buffer = b""
+            if ended:
+                if not self.discarding and self.events < 64:
+                    match = re.fullmatch(rb"DOUBAO_TRACE\|([a-z_]{1,48})\|(-?[0-9]{1,10})\n", self.buffer)
+                    if match:
+                        stage = match[1].decode("ascii")
+                        code = int(match[2])
+                        if stage in STAGES and -(2 ** 31) <= code < 2 ** 31:
+                            trace("native_stage", stage=stage, code=code)
+                            self.events += 1
+                self.buffer = b""
+                self.discarding = False
+
+    def drain(self, stream):
+        # No reader thread or additional process; no blocking reads. Bound work
+        # per receiver tick even if a child emits unexpected output continuously.
+        try:
+            for _ in range(4):
+                if not select.select([stream], [], [], 0)[0]:
+                    break
+                data = os.read(stream.fileno(), 4096)
+                if not data:
+                    break
+                self.feed(data)
+        except (OSError, ValueError):
+            pass  # Diagnostics cannot change action results.
+
+
 def paste_matching(deadline, fingerprint, stop=lambda: False):
     remaining = deadline - time.monotonic()
     if remaining <= 0.1 or stop():
         return "expired"
-    # Native process captures focus BEFORE waiting, rechecks the exact current
-    # pasteboard after its hash, and checks both again immediately before ⌘V.
-    proc = subprocess.Popen(["/usr/bin/osascript", str(HERE / "prearmed_paste.applescript"),
-                             str((time.time() + remaining) * 1000), fingerprint],
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    started = time.monotonic()
+    termination = "spawn_error"
+    proc = None
+    progress = NativeProgress()
+    trace("process_start", remaining_ms=remaining * 1000)
     try:
+        # Each pipe belongs to this single action. Native progress inherits its
+        # action context here; no body, fingerprint or raw stderr is retained.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.1 or stop():
+            termination = "stop" if stop() else "deadline"
+            return "receiver_stopped" if stop() else "expired"
+        proc = subprocess.Popen(["/usr/bin/osascript", str(HERE / "prearmed_paste.applescript"),
+                                 str((time.time() + remaining) * 1000), fingerprint],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env={**os.environ, "DOUBAO_PASTE_TRACE": "1",
+                                     "DOUBAO_PASTE_TRACE_ID": current_action_id() or ""})
         while proc.poll() is None:
+            progress.drain(proc.stderr)
             if stop() or time.monotonic() >= deadline:
+                termination = "stop" if stop() else "deadline"
                 proc.terminate()
                 try:
                     proc.wait(timeout=0.5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=1)
+                # A dispatched command may not have returned before termination.
+                # An expired result never authorizes retry or proves no dispatch.
                 return "receiver_stopped" if stop() else "expired"
             time.sleep(0.025)
+        termination = "exit"
         output = proc.stdout.read().strip()
         return native_result(output, proc.returncode)
     finally:
-        if proc.stdout:
-            proc.stdout.close()
+        if proc:
+            progress.drain(proc.stderr)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+        trace("process_end", elapsed_ms=(time.monotonic() - started) * 1000,
+              remaining_ms=(deadline - time.monotonic()) * 1000,
+              termination=termination, exit_code=proc.returncode if proc else None)
 
 
 class MatchConsumer:
@@ -213,6 +299,7 @@ class MatchConsumer:
             return None
         action_id = action["action_id"]
         if action_id in self.seen:
+            trace("action_duplicate", action_id=action_id)
             return self.seen[action_id]  # retry ACK only, never a second key
         if len(self.seen) >= MAX_ACTIONS_PER_SESSION:
             return None
@@ -223,15 +310,21 @@ class MatchConsumer:
         if type(remaining) not in {int, float} or not math.isfinite(remaining) or not 0 < remaining <= 5000:
             return self.seen[action_id]
         deadline = poll_started + remaining / 1000
+        trace("action_start", action_id=action_id, remaining_ms=(deadline - self.monotonic()) * 1000)
         if self.preparation != (action["preparation_id"], action["sha256"]):
             outcome = "mismatch"
         else:
             # Waiting for an explicit relay paste consumes this action's budget.
             budget = max(0, deadline - self.monotonic())
-            if self.action_lock.acquire(timeout=budget):
+            lock_started = self.monotonic()
+            acquired = self.action_lock.acquire(timeout=budget)
+            trace("lock_wait", action_id=action_id, lock_ms=(self.monotonic() - lock_started) * 1000,
+                  remaining_ms=(deadline - self.monotonic()) * 1000)
+            if acquired:
                 try:
                     if deadline - self.monotonic() > 0.1:
-                        outcome = self.paste(deadline, action["sha256"])
+                        with action_context(action_id):
+                            outcome = self.paste(deadline, action["sha256"])
                 except Exception:
                     outcome = "paste_failed"
                 finally:
@@ -338,16 +431,21 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                 job = None
                 pending = {}
                 submitted = set()
-                def execute_and_ack(action, poll_started):
-                    result = consumer.consume(action, poll_started)
-                    if not result:
-                        raise ApiError("invalid_action")
-                    action_id, status, reason = result
-                    emit("action", action_id=action_id, status=status, reason=reason)
-                    ack = {**identity, "action_id": action_id, "status": status}
-                    if reason:
-                        ack["reason"] = reason
-                    api.request("ack", ack)
+                def execute_and_ack(action, poll_started, received_at):
+                    with action_context(action.get("action_id")):
+                        trace("action_start", queue_ms=(time.monotonic() - received_at) * 1000)
+                        result = consumer.consume(action, poll_started)
+                        if not result:
+                            raise ApiError("invalid_action")
+                        action_id, status, reason = result
+                        emit("action", action_id=action_id, status=status, reason=reason)
+                        trace("action_result", status=status, reason=reason)
+                        ack = {**identity, "action_id": action_id, "status": status}
+                        if reason:
+                            ack["reason"] = reason
+                        trace("ack_start")
+                        api.request("ack", ack)
+                        trace("ack_end", outcome="ok")
                 emit("session_ready", room=room, protocol=PROTOCOL)
                 while not stopped():
                     if job and job.done():
@@ -360,6 +458,7 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                         break
                     started = time.monotonic()
                     response = api.request("poll", identity)
+                    received_at = time.monotonic()
                     if response.get("session_id") != session_id:
                         raise ApiError("session_changed")
                     if stopped():
@@ -389,21 +488,36 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                         if action_id not in submitted and action_id not in pending:
                             # Preserve the first conservative deadline even when
                             # another action's ACK is slow. No poll is discarded.
-                            pending[action_id] = (action, started)
+                            remaining = action.get("remaining_ms")
+                            trace("action_received", action_id=action_id,
+                                  poll_ms=(received_at - started) * 1000, server_remaining_ms=remaining,
+                                  remaining_ms=(remaining - (received_at - started) * 1000)
+                                  if type(remaining) in {int, float} else None)
+                            pending[action_id] = (action, started, received_at)
                     if job and job.done():
                         job.result()
                         job = None
                     if job is None and pending and len(submitted) < MAX_ACTIONS_PER_SESSION:
                         action_id = next(iter(pending))
-                        action, poll_started = pending.pop(action_id)
+                        action, poll_started, received_at = pending.pop(action_id)
                         submitted.add(action_id)
-                        job = executor.submit(execute_and_ack, action, poll_started)
+                        job = executor.submit(execute_and_ack, action, poll_started, received_at)
                     if job is not None:
                         # A pending action makes server poll return immediately;
                         # keep lease renewal bounded without a busy curl loop.
                         stop_event.wait(0.15)
 
-            except (ApiError, KeyError, subprocess.TimeoutExpired):
+            except (ApiError, KeyError, subprocess.TimeoutExpired) as error:
+                # Detailed endpoint/status is recorded at the bounded API layer.
+                # Never stringify an exception: it may embed a URL or response.
+                if isinstance(error, ControlApiError):
+                    trace("disconnected", outcome="http_error", http_status=error.http_status,
+                          error_code=error.error_code)
+                else:
+                    trace("disconnected", outcome="process_timeout" if isinstance(error, subprocess.TimeoutExpired)
+                          else str(error) if isinstance(error, ApiError) and str(error) in {
+                              "transport_failed", "invalid_response", "invalid_registration", "session_changed",
+                              "preparation_failed", "invalid_action"} else "unexpected_error")
                 emit("disconnected")
             finally:
                 session_lost.set()
@@ -459,6 +573,8 @@ def main():
     for timeout in (args.control_timeout_seconds, args.relay_timeout_seconds):
         if not math.isfinite(timeout) or not 0 < timeout <= 30:
             parser.error("timeouts must be >0 and <=30 seconds")
+    enable_diagnostics()
+    trace("receiver_start", pid=os.getpid(), source_sha=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     api = ControlApi(args.server_url, args.control_timeout_seconds)
     stop_event = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):

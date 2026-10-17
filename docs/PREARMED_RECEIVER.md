@@ -56,3 +56,33 @@ Native confirmation reads field text only in memory. It does not log field or cl
 First inspect the target: insertion may succeed while confirmation or result delivery fails. For a missing insertion, distinguish receiver connectivity, preparation, clipboard match, focus/permission checks, dispatch and readback. Do not disable guards to turn unknown results into success.
 
 Use synthetic text and an ordinary empty input for acceptance. Check actual text, an executed receipt, unchanged-draft clearing, preservation of newer edits, mismatched clipboard rejection and cancellation on focus change. Then validate the intended app. Automated unit tests and Swift self-tests cover logic but not the complete phone/input-method/desktop chain.
+
+## Local failure diagnostics
+
+The production receiver enables `~/Library/Logs/DoubaoInputSync/paste-trace.jsonl`.
+It records an opaque action UUID, timestamps, remaining budget, poll/queue/lock
+and subprocess timings, fixed AppleScript phases, and control endpoint/status
+codes. Idle successful polls are omitted. ACK start and success are separate from
+the local paste result: logging an action result does not prove the server received it.
+
+The native helper's `native-errors.log` adds the same action UUID as a fourth
+column when called by this receiver; older three-column lines remain readable.
+A legacy receiver already running must restart before Python network/queue tracing
+is enabled. The per-action AppleScript still hot-loads phase logging immediately,
+using a locally generated diagnostic UUID when the server action UUID is unavailable.
+It shares that UUID with the native helper. Its fixed phases distinguish focus capture, clipboard matching, dispatch intent,
+dispatch return and insertion verification. An intent may precede a refusal;
+a dispatch return still does not prove insertion. Parent deadline termination can
+also interrupt a call after dispatch, so `expired` alone never authorizes retry.
+
+Each diagnostic family retains at most three files of 2 MiB each, with private
+file permissions; native events are also capped per process. Logging failures
+are ignored. The logs omit clipboard/field text, content fingerprints, URLs,
+window titles, room names, credentials and raw subprocess errors. Keep runtime
+logs out of Git and redact incident excerpts before sharing. Importing the Python
+receiver in a fixture does not enable its log sink.
+
+These diagnostics do not extend action deadlines, change the selected paste
+route or retry uncertain paste commands. Pure subprocess tests cover timeout
+before/after dispatch markers without operating the desktop. Real input-method
+and target-app insertion still require their own acceptance.

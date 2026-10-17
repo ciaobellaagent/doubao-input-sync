@@ -15,19 +15,53 @@ func inputResult(role: String, subrole: String, enabled: Bool) -> String? {
     if subrole == "AXSecureTextField" { return "unsafe_target" }
     return allowedRoles.contains(role) && enabled ? nil : "no_focused_input"
 }
+let traceActionID: String? = {
+    guard let raw = ProcessInfo.processInfo.environment["DOUBAO_PASTE_TRACE_ID"],
+          let uuid = UUID(uuidString: raw), uuid.uuidString.lowercased() == raw else { return nil }
+    return raw
+}()
+var diagnosticCount = 0
 func note(_ stage: String, _ code: Int32) {
+    guard diagnosticCount < 64 else { return }
+    diagnosticCount += 1
     let directory = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Logs/DoubaoInputSync")
     do {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
         let path = directory.appendingPathComponent("native-errors.log").path
-        let fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0o600)
+        // Serialize only diagnostic rotation/writes; it cannot authorize input.
+        let lockFD = open(path + ".lock", O_WRONLY | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
+        guard lockFD >= 0 else { return }
+        defer { close(lockFD) }
+        guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else { return }
+        defer { flock(lockFD, LOCK_UN) }
+        for candidate in [path, path + ".1", path + ".2"] {
+            var metadata = stat()
+            if lstat(candidate, &metadata) == 0 {
+                guard (metadata.st_mode & S_IFMT) == S_IFREG else { return }
+                if metadata.st_size > 2 * 1024 * 1024 {
+                    let oversized = open(candidate, O_WRONLY | O_NOFOLLOW | O_NONBLOCK)
+                    guard oversized >= 0 else { return }
+                    let trimmed = ftruncate(oversized, 0)
+                    close(oversized)
+                    guard trimmed == 0 else { return }
+                }
+            }
+        }
+        var metadata = stat()
+        let line = "\(Date().timeIntervalSince1970 * 1000)|\(stage)|\(code)|\(traceActionID ?? "-")\n"
+        if lstat(path, &metadata) == 0 && metadata.st_size + Int64(line.utf8.count) > 2 * 1024 * 1024 {
+            guard unlink(path + ".2") == 0 || errno == ENOENT else { return }
+            guard rename(path + ".1", path + ".2") == 0 || errno == ENOENT else { return }
+            guard rename(path, path + ".1") == 0 else { return }
+        }
+        let fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_NONBLOCK, 0o600)
         guard fd >= 0 else { return }
         defer { close(fd) }
-        let line = "\(Date().timeIntervalSince1970 * 1000)|\(stage)|\(code)\n"
         _ = line.withCString { write(fd, $0, strlen($0)) }
     } catch { /* Diagnostics cannot authorize or retry an action. */ }
 }
+
 struct AXFailure: Error {
     let stage: String
     let code: AXError
@@ -415,11 +449,13 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
             note("ax_focus_read_retry", 0)
         })
         note("native_target_pid", initial.pid)
+        note("native_focus_ready", 0)
         guard initial.pid == expectedPid else {
             return "focus_changed"
         }
         if let result = try roleCheck(initial.field) { return result }
         if modifiersHeld(.initial) { return "modifier_held" }
+        note("native_clipboard_wait", 0)
         while !expired() && !ownerGone() {
             guard sameFocus(initial, try focus(system, expectedPid)) else { return "focus_changed" }
             let count = clipboard.changeCount
@@ -434,12 +470,16 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
                 guard clipboard.changeCount == count, clipboard.string(forType: .string) == text else {
                     return "clipboard_changed"
                 }
+                note("native_clipboard_matched", 0)
                 let before = try inputSnapshot(initial.field)
                 guard let expected = expectedInsertion(before.text, before.range, text),
                       !before.text.utf16.elementsEqual(expected.utf16) else {
                     note("verify_unobservable", 0); return "paste_failed"
                 }
                 let menuItem = isWorkBuddy ? try pasteMenuItem(initial.app) : nil
+                // Intent alone is never proof of dispatch. All final field,
+                // snapshot, modifier, clipboard and deadline checks follow it.
+                note("native_dispatch_intent", 0)
                 // Leave time to observe insertion, all within the original deadline.
                 guard deadline - Date().timeIntervalSince1970 * 1000 >= 800 else { return "expired" }
                 guard sameFocus(initial, try focus(system, expectedPid)) else { return "focus_changed" }
@@ -471,6 +511,7 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
                 // during menu dismissal can fail even when insertion succeeded.
                 // Focus may change after dispatch; confirmed text in the original
                 // field is still evidence of insertion. No other field is read.
+                note("native_verify_begin", 0)
                 AXUIElementSetMessagingTimeout(initial.field, 0.1)
                 let confirmation = waitForInsertion(before: before.text, expected: expected,
                     emptyWorkBuddyPaste: isWorkBuddy ? text : nil, deadline: deadline,

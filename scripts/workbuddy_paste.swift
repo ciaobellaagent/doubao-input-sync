@@ -57,6 +57,73 @@ struct FocusChanged: Error {}
 struct ActionStopped: Error {
     let result: String
 }
+struct TargetRejected: Error {
+    let result: String
+}
+enum InputEligibility {
+    case editable
+    case unsupported(Int32)
+    case blocked(String)
+}
+func roleCode(_ role: String) -> Int32 {
+    switch role {
+    case "AXWebArea": return 4
+    case "AXGroup": return 5
+    case "AXUnknown": return 6
+    case "AXWindow": return 7
+    case "AXScrollArea": return 8
+    default: return 0
+    }
+}
+func eligibility(role: String, subrole: String, enabled: Bool, protected: Bool) -> InputEligibility {
+    if protected || subrole == "AXSecureTextField" { return .blocked("unsafe_target") }
+    if !enabled { return .blocked("no_focused_input") }
+    return allowedRoles.contains(role) ? .editable : .unsupported(roleCode(role))
+}
+// Read both representations when the app returns a wrapper instead of an input.
+// Never search children, accept a different process, or promote wrapper roles.
+func resolveFocusedField<Element>(readApp: () throws -> Element, readSystem: () throws -> Element,
+                                  ownerCheck: (Element) throws -> Void,
+                                  assess: (Element) throws -> InputEligibility,
+                                  report: (String, Int32) -> Void = { _, _ in }) throws -> Element {
+    let appCandidate: Element?
+    let appReadFailure: AXFailure?
+    do {
+        appCandidate = try readApp()
+        appReadFailure = nil
+    } catch let error as AXFailure {
+        guard [.cannotComplete, .noValue, .attributeUnsupported].contains(error.code) else { throw error }
+        appCandidate = nil
+        appReadFailure = error
+    }
+    let appFailure: AXFailure
+    if let candidate = appCandidate {
+        try ownerCheck(candidate)
+        switch try assess(candidate) {
+        case .editable: return candidate
+        case .blocked(let result): throw TargetRejected(result: result)
+        case .unsupported(let code):
+            report("ax_app_nontext_role", code)
+            appFailure = AXFailure(stage: "ax_app_nontext", code: .noValue)
+        }
+    } else {
+        appFailure = appReadFailure!
+    }
+    let candidate: Element
+    do {
+        candidate = try readSystem()
+    } catch let error as AXFailure {
+        throw FocusReadFailure(app: appFailure, system: error)
+    }
+    try ownerCheck(candidate)
+    switch try assess(candidate) {
+    case .editable: return candidate
+    case .blocked(let result): throw TargetRejected(result: result)
+    case .unsupported(let code):
+        report("ax_system_nontext_role", code)
+        throw TargetRejected(result: "no_focused_input")
+    }
+}
 struct FocusReadFailure: Error {
     let app: AXFailure
     let system: AXFailure
@@ -76,7 +143,9 @@ func initialFocusCanRetry(_ error: Error) -> Bool {
             $0 == .cannotComplete || $0 == .noValue || $0 == .attributeUnsupported
         }
     }
-    return (error as? AXFailure)?.code == .cannotComplete
+    guard let failure = error as? AXFailure else { return false }
+    return failure.code == .cannotComplete &&
+        ["ax_window", "ax_window_recheck", "ax_app_field", "ax_system_field"].contains(failure.stage)
 }
 // Only initial discovery may re-read AX. Callbacks do not change app state or paste.
 // Keep this injectable so retry, cancellation and late results can be tested
@@ -113,17 +182,18 @@ func focus(_ system: AXUIElement, _ expectedPid: pid_t,
     try observeWindow?(window)
     // Use the confirmed front app directly: querying focusedApplication on the
     // global AX object can fail even when its app-level interface works.
-    let field: AXUIElement
-    do { field = try elementAttribute(app, kAXFocusedUIElementAttribute, "ax_app_field") }
-    catch let appFailure as AXFailure {
-        do { field = try elementAttribute(system, kAXFocusedUIElementAttribute, "ax_system_field") }
-        catch let systemFailure as AXFailure {
-            throw FocusReadFailure(app: appFailure, system: systemFailure)
+    let field = try resolveFocusedField(readApp: {
+        try elementAttribute(app, kAXFocusedUIElementAttribute, "ax_app_field")
+    }, readSystem: {
+        try elementAttribute(system, kAXFocusedUIElementAttribute, "ax_system_field")
+    }, ownerCheck: { candidate in
+        var fieldPid: pid_t = 0
+        guard AXUIElementGetPid(candidate, &fieldPid) == .success, fieldPid == pid else {
+            throw AXFailure(stage: "ax_field_owner", code: .invalidUIElement)
         }
-    }
-    var fieldPid: pid_t = 0
-    guard AXUIElementGetPid(field, &fieldPid) == .success, fieldPid == pid else {
-        throw AXFailure(stage: "ax_field_owner", code: .invalidUIElement)
+    }, assess: fieldEligibility, report: note)
+    guard CFEqual(window, try elementAttribute(app, kAXFocusedWindowAttribute, "ax_window_recheck")) else {
+        throw FocusChanged()
     }
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { throw FocusChanged() }
     return Focus(app: app, window: window, field: field, pid: pid)
@@ -147,15 +217,21 @@ func optionalBool(_ field: AXUIElement, _ name: String, _ stage: String) throws 
     }
     return result
 }
-func roleCheck(_ field: AXUIElement) throws -> String? {
+func fieldEligibility(_ field: AXUIElement) throws -> InputEligibility {
     guard let role = try attribute(field, kAXRoleAttribute, "ax_role") as? String else {
         throw AXFailure(stage: "ax_role_type", code: .illegalArgument)
     }
     let subrole = try optionalString(field, kAXSubroleAttribute, "ax_subrole") ?? ""
     let enabled = try optionalBool(field, kAXEnabledAttribute, "ax_enabled") ?? true
     let protected = try optionalBool(field, "AXProtectedContent", "ax_protected") ?? false
-    if protected { return "unsafe_target" }
-    return inputResult(role: role, subrole: subrole, enabled: enabled)
+    return eligibility(role: role, subrole: subrole, enabled: enabled, protected: protected)
+}
+func roleCheck(_ field: AXUIElement) throws -> String? {
+    switch try fieldEligibility(field) {
+    case .editable: return nil
+    case .unsupported: return "no_focused_input"
+    case .blocked(let result): return result
+    }
 }
 func modifiersHeld() -> Bool {
     !NSEvent.modifierFlags.intersection([.shift, .control, .option, .command]).isEmpty
@@ -361,6 +437,8 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
         return ownerGone() ? "receiver_stopped" : "clipboard_timeout"
     } catch let error as ActionStopped {
         return error.result
+    } catch let error as TargetRejected {
+        return error.result
     } catch is FocusChanged {
         // Only pre-dispatch focus checks throw here. Verification catches its
         // own errors and always reports an unconfirmed result after dispatch.
@@ -383,6 +461,94 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
     precondition(inputResult(role: "AXTextField", subrole: "AXSecureTextField", enabled: true) == "unsafe_target")
     precondition(inputResult(role: "AXWebArea", subrole: "", enabled: true) == "no_focused_input")
     precondition(inputResult(role: "AXTextArea", subrole: "", enabled: false) == "no_focused_input")
+    // Representations can disagree about wrappers. Resolve the actual focused
+    // input without allowing a wrapper, a foreign PID or a protected element.
+    var systemReads = 0
+    func unexpectedFocusRead() -> String { preconditionFailure("this focus path must not read system focus") }
+    func unexpectedFocusAssessment(_: String) -> InputEligibility { preconditionFailure("foreign field must not be inspected") }
+    func testEligibility(_ element: String) -> InputEligibility {
+        switch element {
+        case "input": return .editable
+        case "secure": return .blocked("unsafe_target")
+        case "disabled": return .blocked("no_focused_input")
+        default: return .unsupported(5)
+        }
+    }
+    do {
+        let appInput = try resolveFocusedField(readApp: { "input" },
+            readSystem: unexpectedFocusRead,
+            ownerCheck: { _ in }, assess: testEligibility)
+        precondition(appInput == "input")
+        let wrappedInput = try resolveFocusedField(readApp: { "wrapper" },
+            readSystem: { systemReads += 1; return "input" }, ownerCheck: { _ in }, assess: testEligibility)
+        precondition(wrappedInput == "input" && systemReads == 1)
+        let missingAppFocus = try resolveFocusedField(readApp: {
+            throw AXFailure(stage: "ax_app_field", code: .noValue)
+        }, readSystem: { "input" }, ownerCheck: { _ in }, assess: testEligibility)
+        precondition(missingAppFocus == "input")
+    } catch { preconditionFailure("a verified focused input should resolve") }
+    for blocked in ["secure", "disabled"] {
+        do {
+            let _: String = try resolveFocusedField(readApp: { blocked },
+                readSystem: unexpectedFocusRead,
+                ownerCheck: { _ in }, assess: testEligibility)
+            preconditionFailure("blocked focus must stop")
+        } catch let error as TargetRejected {
+            precondition(error.result == (blocked == "secure" ? "unsafe_target" : "no_focused_input"))
+        } catch { preconditionFailure("blocked target reason must be retained") }
+        do {
+            let _: String = try resolveFocusedField(readApp: { "wrapper" }, readSystem: { blocked },
+                ownerCheck: { _ in }, assess: testEligibility)
+            preconditionFailure("blocked system focus must stop")
+        } catch is TargetRejected {} catch { preconditionFailure("blocked global focus must be rejected") }
+    }
+    do {
+        let _: String = try resolveFocusedField(readApp: { "wrapper" }, readSystem: { "wrapper" },
+            ownerCheck: { _ in }, assess: testEligibility)
+        preconditionFailure("wrappers are not editable inputs")
+    } catch let error as TargetRejected { precondition(error.result == "no_focused_input") }
+    catch { preconditionFailure("wrapper rejection must be retained") }
+    do {
+        let _: String = try resolveFocusedField(readApp: { "foreign-input" },
+            readSystem: unexpectedFocusRead,
+            ownerCheck: { _ in throw AXFailure(stage: "ax_field_owner", code: .invalidUIElement) },
+            assess: unexpectedFocusAssessment)
+        preconditionFailure("foreign app focus must stop")
+    } catch let error as AXFailure { precondition(error.code == .invalidUIElement) }
+    catch { preconditionFailure("owner error must be retained") }
+    do {
+        let _: String = try resolveFocusedField(readApp: {
+            throw AXFailure(stage: "ax_app_field", code: .apiDisabled)
+        }, readSystem: unexpectedFocusRead,
+            ownerCheck: { _ in }, assess: testEligibility)
+        preconditionFailure("permission failure must stop")
+    } catch let error as AXFailure { precondition(error.code == .apiDisabled) }
+    catch { preconditionFailure("permission error must be retained") }
+    do {
+        let _: String = try resolveFocusedField(readApp: { "wrapper" }, readSystem: { "foreign-input" },
+            ownerCheck: { candidate in
+                if candidate == "foreign-input" { throw AXFailure(stage: "ax_field_owner", code: .invalidUIElement) }
+            }, assess: testEligibility)
+        preconditionFailure("foreign system focus must stop")
+    } catch let error as AXFailure { precondition(error.code == .invalidUIElement) }
+    catch { preconditionFailure("global owner error must be retained") }
+    do {
+        let _: String = try resolveFocusedField(readApp: { "input" }, readSystem: unexpectedFocusRead,
+            ownerCheck: { _ in }, assess: { _ in throw AXFailure(stage: "ax_protected", code: .cannotComplete) })
+        preconditionFailure("unreadable safety attributes must stop")
+    } catch let error as AXFailure {
+        precondition(error.stage == "ax_protected" && !initialFocusCanRetry(error))
+    } catch { preconditionFailure("safety attribute error must be retained") }
+    do {
+        let _: String = try resolveFocusedField(readApp: { "wrapper" }, readSystem: { "input" },
+            ownerCheck: { _ in }, assess: { candidate in
+                if candidate == "input" { throw AXFailure(stage: "ax_enabled", code: .cannotComplete) }
+                return .unsupported(5)
+            })
+        preconditionFailure("unreadable system safety attributes must stop")
+    } catch let error as AXFailure {
+        precondition(error.stage == "ax_enabled" && !initialFocusCanRetry(error))
+    } catch { preconditionFailure("system safety attribute error must be retained") }
     precondition(expectedInsertion("A😀B", CFRange(location: 1, length: 2), "中文\n🌱") == "A中文\n🌱B")
     precondition(expectedInsertion("abc", CFRange(location: 3, length: 0), "尾") == "abc尾")
     precondition(expectedInsertion("abc", CFRange(location: -1, length: 0), "x") == nil)

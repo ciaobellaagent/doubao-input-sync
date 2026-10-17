@@ -30,10 +30,12 @@ Prepared and explicit relay actions share one local action lock. Secure fields a
 | Route | Trigger | Confirmation |
 | --- | --- | --- |
 | WorkBuddy | Accessibility `AXPress` on its standard `paste:` menu item | Read the original field and verify expected insertion |
-| Native fallback after System Events focused-object error | `CGEvent` Command-V, with the same expected front process | Read the original field and verify expected insertion |
+| Native fallback after a System Events focused-object error or enabled nontext wrapper | `CGEvent` Command-V, with the same expected front process | Resolve the actual focused text field, then read the original field and verify expected insertion |
 | Ordinary System Events | `keystroke "v" using command down` | Dispatch only; no generic field readback |
 
 WorkBuddy is an intentional compatibility exception shown in the phone UI. The helper also initializes accessibility for recognized Electron applications. This does not promise support for every editor or establish that menu paste is universally faster or more reliable.
+
+Ordinary apps are not selected by an app-name allowlist. When System Events exposes an enabled nontext wrapper, native AX may independently resolve the real focused field from the same app or the system focus. Both representations must belong to the expected foreground process and stable window. Wrappers are never accepted as text inputs, no descendant search is used to guess a field, and disabled/protected inputs or unreadable safety attributes stop the action. This is generic focus resolution, not a browser- or website-specific driver. The native helper's installed filename retains its historical WorkBuddy name.
 
 If initial native focus discovery returns a transient AX `cannotComplete` error, the helper retries the read once after 25 ms. Generic retries do not set accessibility attributes or change the target app. They stay within the original deadline, check receiver liveness and foreground PID around the retry, and preserve any window captured before the error. A changed window, hard focus-read error or unreadable input stops the action. App-level and global focus errors are both retained as stage/code diagnostics. Subsequent focus checks and post-dispatch confirmation never initialize or switch the target.
 

@@ -12,6 +12,32 @@ GUARDS = ("prearmed_paste.applescript", "signal_paste.applescript")
 
 @unittest.skipUnless(sys.platform == "darwin", "AppleScript compiler requires macOS")
 class AppleScriptInputSafetyTests(unittest.TestCase):
+    def test_native_focus_resolution_is_only_for_enabled_nontext_wrappers(self):
+        source = (SCRIPTS / "prearmed_paste.applescript").read_text()
+        handlers = []
+        for name in ("inputSafety", "inputRoute"):
+            start = source.index(f"on {name}(")
+            end = source.index(f"end {name}", start) + len(f"end {name}")
+            handlers.append(source[start:end])
+        cases = [
+            ('"AXTextArea", "", true, false', "ready"),
+            ('"AXWebArea", "", true, false', "native_focus"),
+            ('"AXGroup", "", true, false', "native_focus"),
+            ('"AXUnknown", "", true, false', "native_focus"),
+            ('"AXWebArea", "", false, false', "no_focused_input"),
+            ('"AXTextArea", "", false, false', "no_focused_input"),
+            ('"AXGroup", "AXSecureTextField", true, false', "unsafe_target"),
+            ('"AXGroup", "", true, true', "unsafe_target"),
+        ]
+        calls = ["set outcomes to {}"]
+        calls += [f"set end of outcomes to my inputRoute({arguments})" for arguments, _ in cases]
+        calls += ['set AppleScript\'s text item delimiters to "|"', "return outcomes as text"]
+        program = "on run\n" + "\n".join(calls) + "\nend run\n" + "\n".join(handlers)
+        result = subprocess.run(["/usr/bin/osascript", "-"], input=program,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().split("|"), [expected for _, expected in cases])
+
     def test_both_complete_scripts_compile_without_running(self):
         with tempfile.TemporaryDirectory() as directory:
             for name in GUARDS:

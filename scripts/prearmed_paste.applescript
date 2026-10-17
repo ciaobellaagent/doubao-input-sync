@@ -21,7 +21,7 @@ on run argv
             set targetProcess to first application process whose unix id is targetPid
             if (bundle identifier of targetProcess) is "com.tencent.workbuddy.mac" then
                 set diagnosticStage to "native_workbuddy"
-                return my pasteInWorkBuddy(deadlineMs, expectedHash, targetPid)
+                return my pasteNative(deadlineMs, expectedHash, targetPid)
             end if
             try
                 set diagnosticStage to "focused_input"
@@ -36,11 +36,19 @@ on run argv
                     -- Native AX must independently confirm the same front PID
                     -- and a safe editable field before it may send a key.
                     my recordFailure("system_events_target_pid", targetPid)
-                    return my pasteInWorkBuddy(deadlineMs, expectedHash, targetPid)
+                    return my pasteNative(deadlineMs, expectedHash, targetPid)
                 end if
                 error number lookupCode
             end try
             set safetyResult to my fieldSafety(initialField)
+            if safetyResult is "native_focus" then
+                -- A browser may expose a wrapper to System Events. Native AX
+                -- must independently resolve the actual focused editable field.
+                -- No key has been dispatched and no broad role is allowed here.
+                my recordFailure("system_events_nontext_role", my roleCode(fieldRole))
+                my recordFailure("system_events_target_pid", targetPid)
+                return my pasteNative(deadlineMs, expectedHash, targetPid)
+            end if
             if safetyResult is not "ready" then return safetyResult
         end tell
         set diagnosticStage to "modifiers"
@@ -74,6 +82,7 @@ on run argv
                     if (value of attribute "AXFocusedUIElement" of currentProcess) is not initialField then return "focus_changed"
                     set diagnosticStage to "input_role"
                     set safetyResult to my fieldSafety(initialField)
+                    if safetyResult is "native_focus" then return "focus_changed"
                     if safetyResult is not "ready" then return safetyResult
                     if my modifiersHeld() then return "modifier_held"
                     if my nowMs() ≥ deadlineMs then return "expired"
@@ -131,11 +140,11 @@ on recordFailure(stageName, errorCode)
     end try
 end recordFailure
 
-on pasteInWorkBuddy(deadlineMs, expectedHash, targetPid)
+on pasteNative(deadlineMs, expectedHash, targetPid)
     set nativePath to (current application's NSHomeDirectory() as text) & "/Library/Application Support/DoubaoInputSync/native/workbuddy-paste"
     set ownerPid to current application's NSProcessInfo's processInfo()'s processIdentifier() as integer
     return do shell script quoted form of nativePath & " " & quoted form of (deadlineMs as text) & " " & quoted form of expectedHash & " " & (ownerPid as text) & " " & (targetPid as text)
-end pasteInWorkBuddy
+end pasteNative
 
 on frontmostPid()
     set frontApp to current application's NSWorkspace's sharedWorkspace()'s frontmostApplication()
@@ -158,8 +167,24 @@ on fieldSafety(theField)
         if "AXEnabled" is in attributeNames then set fieldEnabled to value of attribute "AXEnabled" of theField
         if "AXProtectedContent" is in attributeNames then set fieldProtected to value of attribute "AXProtectedContent" of theField
     end tell
-    return my inputSafety(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)
+    return my inputRoute(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)
 end fieldSafety
+
+-- Fixed diagnostic codes only; never record AX labels, descriptions or values.
+on roleCode(fieldRole)
+    if fieldRole is "AXWebArea" then return 4
+    if fieldRole is "AXGroup" then return 5
+    if fieldRole is "AXUnknown" then return 6
+    if fieldRole is "AXWindow" then return 7
+    if fieldRole is "AXScrollArea" then return 8
+    return 0
+end roleCode
+
+on inputRoute(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)
+    set safetyStatus to my inputSafety(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)
+    if safetyStatus is "no_focused_input" and fieldEnabled and fieldRole is not in {"AXTextArea", "AXTextField", "AXComboBox"} then return "native_focus"
+    return safetyStatus
+end inputRoute
 
 -- Pure policy, also exercised without accessibility or clipboard access.
 on inputSafety(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)

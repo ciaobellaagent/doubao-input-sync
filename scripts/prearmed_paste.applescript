@@ -30,17 +30,19 @@ on run argv
                 set initialWindow to value of attribute "AXFocusedWindow" of targetProcess
                 set diagnosticStage to "input_role"
                 set fieldRole to value of attribute "AXRole" of initialField
+                set safetyResult to my fieldSafety(initialField)
             on error lookupText number lookupCode
-                if lookupCode is -1728 then
-                    -- System Events may not represent the focused AX object.
+                if my nativeFocusError(diagnosticStage, lookupCode) then
+                    -- System Events may not represent the focused AX object
+                    -- or its metadata types. Nothing has been dispatched.
                     -- Native AX must independently confirm the same front PID
                     -- and a safe editable field before it may send a key.
+                    my recordFailure("system_events_representation_error", lookupCode)
                     my recordFailure("system_events_target_pid", targetPid)
                     return my pasteNative(deadlineMs, expectedHash, targetPid)
                 end if
                 error number lookupCode
             end try
-            set safetyResult to my fieldSafety(initialField)
             if safetyResult is "native_focus" then
                 -- A browser may expose a wrapper to System Events. Native AX
                 -- must independently resolve the actual focused editable field.
@@ -163,9 +165,9 @@ on fieldSafety(theField)
         set fieldSubrole to ""
         set fieldEnabled to true
         set fieldProtected to false
-        if "AXSubrole" is in attributeNames then set fieldSubrole to value of attribute "AXSubrole" of theField
-        if "AXEnabled" is in attributeNames then set fieldEnabled to value of attribute "AXEnabled" of theField
-        if "AXProtectedContent" is in attributeNames then set fieldProtected to value of attribute "AXProtectedContent" of theField
+        if "AXSubrole" is in attributeNames then set fieldSubrole to my optionalAXText(value of attribute "AXSubrole" of theField, "")
+        if "AXEnabled" is in attributeNames then set fieldEnabled to my optionalAXBool(value of attribute "AXEnabled" of theField, true)
+        if "AXProtectedContent" is in attributeNames then set fieldProtected to my optionalAXBool(value of attribute "AXProtectedContent" of theField, false)
     end tell
     return my inputRoute(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)
 end fieldSafety
@@ -179,6 +181,25 @@ on roleCode(fieldRole)
     if fieldRole is "AXScrollArea" then return 8
     return 0
 end roleCode
+
+on nativeFocusError(stageName, errorCode)
+    return stageName is in {"focused_input", "focused_window", "input_role"} and errorCode is in {-1728, -1700}
+end nativeFocusError
+
+-- Chrome can advertise an optional attribute and return missing value.
+-- Normalize absence only, matching native AX noValue handling. Actual read
+-- exceptions still propagate; present values must have the exact expected type.
+on optionalAXText(attributeValue, defaultValue)
+    if attributeValue is missing value then return defaultValue
+    if class of attributeValue is not text then error number -1700
+    return attributeValue
+end optionalAXText
+
+on optionalAXBool(attributeValue, defaultValue)
+    if attributeValue is missing value then return defaultValue
+    if class of attributeValue is not boolean then error number -1700
+    return attributeValue
+end optionalAXBool
 
 on inputRoute(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)
     set safetyStatus to my inputSafety(fieldRole, fieldSubrole, fieldEnabled, fieldProtected)

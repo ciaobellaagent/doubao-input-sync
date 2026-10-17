@@ -240,8 +240,51 @@ func roleCheck(_ field: AXUIElement) throws -> String? {
     case .blocked(let result): return result
     }
 }
-func modifiersHeld() -> Bool {
-    !NSEvent.modifierFlags.intersection([.shift, .control, .option, .command]).isEmpty
+let blockingModifiers: CGEventFlags = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
+struct ModifierSnapshot {
+    let appKit: UInt64
+    let session: UInt64
+    let hardware: UInt64
+    var blocked: Bool { (appKit | session | hardware) & blockingModifiers.rawValue != 0 }
+}
+enum ModifierCheck: String { case initial, clipboardReady = "clipboard_ready", preDispatch = "pre_dispatch" }
+func modifierBits(_ raw: UInt64) -> Int32 {
+    let flags: [CGEventFlags] = [.maskShift, .maskControl, .maskAlternate, .maskCommand]
+    return flags.enumerated().reduce(0) { result, item in
+        result | (raw & item.element.rawValue == 0 ? 0 : Int32(1 << item.offset))
+    }
+}
+func modifiersHeld(_ stage: ModifierCheck,
+                   sample: () -> ModifierSnapshot = {
+                       ModifierSnapshot(appKit: UInt64(NSEvent.modifierFlags.rawValue),
+                           session: CGEventSource.flagsState(.combinedSessionState).rawValue,
+                           hardware: CGEventSource.flagsState(.hidSystemState).rawValue)
+                   }, report: (String, Int32) -> Void = note) -> Bool {
+    let state = sample()
+    if state.blocked {
+        // A single snapshot drives both refusal and bounded diagnostics. Keep
+        // the hardware check even if synthesized flags clear the session state.
+        report("modifier_" + stage.rawValue + "_appkit", modifierBits(state.appKit))
+        report("modifier_" + stage.rawValue + "_session", modifierBits(state.session))
+        report("modifier_" + stage.rawValue + "_hardware", modifierBits(state.hardware))
+    }
+    return state.blocked
+}
+struct PasteKeyStep {
+    let key: CGKeyCode
+    let down: Bool
+    let flags: CGEventFlags
+}
+let pasteKeySteps = [PasteKeyStep(key: 9, down: true, flags: .maskCommand),
+                     PasteKeyStep(key: 9, down: false, flags: [])]
+func pasteKeyEvents(_ source: CGEventSource) -> [CGEvent]? {
+    var events: [CGEvent] = []
+    for step in pasteKeySteps {
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: step.key, keyDown: step.down) else { return nil }
+        event.flags = step.flags
+        events.append(event)
+    }
+    return events
 }
 struct InputSnapshot {
     let text: String
@@ -376,7 +419,7 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
             return "focus_changed"
         }
         if let result = try roleCheck(initial.field) { return result }
-        if modifiersHeld() { return "modifier_held" }
+        if modifiersHeld(.initial) { return "modifier_held" }
         while !expired() && !ownerGone() {
             guard sameFocus(initial, try focus(system, expectedPid)) else { return "focus_changed" }
             let count = clipboard.changeCount
@@ -386,7 +429,7 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
                 }
                 guard sameFocus(initial, try focus(system, expectedPid)) else { return "focus_changed" }
                 if let result = try roleCheck(initial.field) { return result }
-                if modifiersHeld() { return "modifier_held" }
+                if modifiersHeld(.clipboardReady) { return "modifier_held" }
                 guard !expired(), !ownerGone() else { return "expired" }
                 guard clipboard.changeCount == count, clipboard.string(forType: .string) == text else {
                     return "clipboard_changed"
@@ -402,7 +445,7 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
                 guard sameFocus(initial, try focus(system, expectedPid)) else { return "focus_changed" }
                 guard sameSnapshot(before, try inputSnapshot(initial.field)) else { return "focus_changed" }
                 guard !expired(), !ownerGone() else { return "expired" }
-                if modifiersHeld() { return "modifier_held" }
+                if modifiersHeld(.preDispatch) { return "modifier_held" }
                 guard clipboard.changeCount == count, clipboard.string(forType: .string) == text else {
                     return "clipboard_changed"
                 }
@@ -416,10 +459,10 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
                     guard error == .success else { return "paste_failed" }
                 } else {
                     guard let source = CGEventSource(stateID: .combinedSessionState),
-                          let down = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
-                          let up = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else { return "paste_failed" }
-                    down.flags = .maskCommand; up.flags = .maskCommand
-                    down.post(tap: .cghidEventTap); up.post(tap: .cghidEventTap)
+                          let events = pasteKeyEvents(source) else { return "paste_failed" }
+                    // End the V key pair without declaring Command still held.
+                    // No extra modifier release or uncertain paste retry is sent.
+                    for event in events { event.post(tap: .cghidEventTap) }
                     note("key_paste_dispatch", 0)
                 }
                 // Dispatch success is not insertion success. Never retry/fallback
@@ -469,6 +512,37 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
 }
 
 if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
+    // Pure event-plan checks: never create/post an OS event or query live keys.
+    precondition(pasteKeySteps.count == 2)
+    precondition(pasteKeySteps.allSatisfy { $0.key == 9 })
+    precondition(pasteKeySteps.filter { $0.down }.count == 1)
+    precondition(pasteKeySteps[0].down && pasteKeySteps[0].flags == .maskCommand)
+    precondition(!pasteKeySteps[1].down && pasteKeySteps[1].flags.intersection(blockingModifiers).isEmpty)
+    let clearModifiers = ModifierSnapshot(appKit: 0, session: 0, hardware: 0)
+    let nonblocking: CGEventFlags = [.maskAlphaShift, .maskSecondaryFn, .maskNumericPad]
+    precondition(!ModifierSnapshot(appKit: nonblocking.rawValue, session: nonblocking.rawValue,
+                                  hardware: nonblocking.rawValue).blocked)
+    for stage in [ModifierCheck.initial, .clipboardReady, .preDispatch] {
+        for flag in [CGEventFlags.maskShift, .maskControl, .maskAlternate, .maskCommand] {
+            // Any source remains sufficient to stop; hardware cannot be hidden
+            // by a synthetic zero-flag event, nor may a synthetic held flag pass.
+            for state in [ModifierSnapshot(appKit: flag.rawValue, session: 0, hardware: 0),
+                          ModifierSnapshot(appKit: 0, session: flag.rawValue, hardware: 0),
+                          ModifierSnapshot(appKit: 0, session: 0, hardware: flag.rawValue)] {
+                var samples = 0
+                var diagnostics: [(String, Int32)] = []
+                let blocked = modifiersHeld(stage, sample: { samples += 1; return state },
+                    report: { diagnostics.append(($0, $1)) })
+                precondition(blocked && samples == 1 && diagnostics.count == 3)
+                precondition(diagnostics.allSatisfy { $0.0.hasPrefix("modifier_" + stage.rawValue + "_") && (0...15).contains($0.1) })
+            }
+        }
+        var clearSamples = 0
+        precondition(!modifiersHeld(stage, sample: { clearSamples += 1; return clearModifiers },
+            report: { _, _ in preconditionFailure("clear modifiers must not be reported as held") }))
+        precondition(clearSamples == 1)
+    }
+    precondition(modifierBits(blockingModifiers.rawValue) == 15)
     precondition(digest("hello") == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
     for role in allowedRoles { precondition(inputResult(role: role, subrole: "", enabled: true) == nil) }
     precondition(inputResult(role: "AXTextField", subrole: "AXSecureTextField", enabled: true) == "unsafe_target")

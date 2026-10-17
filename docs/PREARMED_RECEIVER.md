@@ -35,6 +35,8 @@ Prepared and explicit relay actions share one local action lock. Secure fields a
 
 WorkBuddy is an intentional compatibility exception shown in the phone UI. The helper also initializes accessibility for recognized Electron applications. This does not promise support for every editor or establish that menu paste is universally faster or more reliable.
 
+If initial native focus discovery returns a transient AX `cannotComplete` error, the helper requests the foreground app's supported `AXManualAccessibility` and `AXEnhancedUserInterface` interfaces, then retries discovery once after 25 ms. This recovery is generic and does not add an app-specific paste route or request OS permission. It stays within the original deadline, checks receiver liveness and foreground PID around recovery, and preserves any window captured before the error. A changed window, hard focus-read error or unreadable input stops the action. App-level and global focus errors are both retained as stage/code diagnostics. Subsequent focus checks and post-dispatch confirmation never initialize or switch the target.
+
 Native confirmation reads field text only in memory. It does not log field or clipboard bodies. Transient read failures can be retried within the original deadline, but the paste itself is never retried. Logs contain stage names, error codes, timestamps and process metadata; treat them as local diagnostic data.
 
 ## Check failures without duplicate input

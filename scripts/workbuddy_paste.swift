@@ -54,21 +54,77 @@ struct Focus {
     let pid: pid_t
 }
 struct FocusChanged: Error {}
-func focus(_ system: AXUIElement, _ expectedPid: pid_t) throws -> Focus {
+struct ActionStopped: Error {
+    let result: String
+}
+struct FocusReadFailure: Error {
+    let app: AXFailure
+    let system: AXFailure
+}
+func recordFocusFailure(_ error: Error) {
+    if let failure = error as? FocusReadFailure {
+        note(failure.app.stage, failure.app.code.rawValue)
+        note(failure.system.stage, failure.system.code.rawValue)
+    } else if let failure = error as? AXFailure {
+        note(failure.stage, failure.code.rawValue)
+    }
+}
+func initialFocusCanRecover(_ error: Error) -> Bool {
+    if let failure = error as? FocusReadFailure {
+        let codes = [failure.app.code, failure.system.code]
+        return codes.contains(.cannotComplete) && codes.allSatisfy {
+            $0 == .cannotComplete || $0 == .noValue || $0 == .attributeUnsupported
+        }
+    }
+    return (error as? AXFailure)?.code == .cannotComplete
+}
+// Only initial discovery may initialize/re-read AX. Neither callback can paste.
+// Keep this injectable so recovery, cancellation and late results can be tested
+// without reading any application, clipboard or accessibility permissions.
+func captureInitialFocus<T>(check: @escaping () throws -> Void, read: () throws -> T,
+                            recover: (Error, () throws -> Void) throws -> Void,
+                            pause: () -> Void = { Thread.sleep(forTimeInterval: 0.025) }) throws -> T {
+    try check()
+    do {
+        let result = try read()
+        try check()
+        return result
+    } catch {
+        guard initialFocusCanRecover(error) else { throw error }
+        try check()
+        try recover(error, check)
+        try check()
+        pause()
+        try check()
+        let result = try read()
+        try check()
+        return result
+    }
+}
+func focus(_ system: AXUIElement, _ expectedPid: pid_t,
+           observeWindow: ((AXUIElement) throws -> Void)? = nil) throws -> Focus {
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { throw FocusChanged() }
     let app = AXUIElementCreateApplication(expectedPid)
     AXUIElementSetMessagingTimeout(app, 0.25)
     let pid = expectedPid
+    // Anchor any window available before initial recovery; reject a different
+    // window on the retry even if it belongs to the same foreground process.
+    let window = try elementAttribute(app, kAXFocusedWindowAttribute, "ax_window")
+    try observeWindow?(window)
     // Use the confirmed front app directly: querying focusedApplication on the
     // global AX object can fail even when its app-level interface works.
     let field: AXUIElement
     do { field = try elementAttribute(app, kAXFocusedUIElementAttribute, "ax_app_field") }
-    catch { field = try elementAttribute(system, kAXFocusedUIElementAttribute, "ax_system_field") }
+    catch let appFailure as AXFailure {
+        do { field = try elementAttribute(system, kAXFocusedUIElementAttribute, "ax_system_field") }
+        catch let systemFailure as AXFailure {
+            throw FocusReadFailure(app: appFailure, system: systemFailure)
+        }
+    }
     var fieldPid: pid_t = 0
     guard AXUIElementGetPid(field, &fieldPid) == .success, fieldPid == pid else {
         throw AXFailure(stage: "ax_field_owner", code: .invalidUIElement)
     }
-    let window = try elementAttribute(app, kAXFocusedWindowAttribute, "ax_window")
     guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { throw FocusChanged() }
     return Focus(app: app, window: window, field: field, pid: pid)
 }
@@ -203,6 +259,7 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
     let isWorkBuddy = NSRunningApplication(processIdentifier: expectedPid)?.bundleIdentifier == "com.tencent.workbuddy.mac"
     if !isWorkBuddy && !CGPreflightPostEventAccess() { note("key_trust", -25211); return "permission_missing" }
     let system = AXUIElementCreateSystemWide()
+    AXUIElementSetMessagingTimeout(system, 0.25)
     let clipboard = NSPasteboard.general
     do {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { return "focus_changed" }
@@ -211,7 +268,30 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
         if ["com.tencent.workbuddy.mac", "com.google.antigravity-ide"].contains(NSRunningApplication(processIdentifier: expectedPid)?.bundleIdentifier ?? "") {
             _ = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
         }
-        let initial = try focus(system, expectedPid)
+        var initialWindow: AXUIElement?
+        let initial = try captureInitialFocus(check: {
+            guard !expired() else { throw ActionStopped(result: "expired") }
+            guard !ownerGone() else { throw ActionStopped(result: "receiver_stopped") }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { throw FocusChanged() }
+        }, read: {
+            try focus(system, expectedPid, observeWindow: { window in
+                if let captured = initialWindow, !CFEqual(captured, window) { throw FocusChanged() }
+                initialWindow = window
+            })
+        }, recover: { failure, check in
+            recordFocusFailure(failure)
+            // A dynamic accessibility tree may not have been enabled by the
+            // target app yet. Request supported interfaces for this PID only;
+            // this does not grant/request OS permission or traverse its tree.
+            for (attributeName, stage) in [("AXManualAccessibility", "ax_initialize_manual"),
+                                           ("AXEnhancedUserInterface", "ax_initialize_enhanced")] {
+                try check()
+                guard deadline - Date().timeIntervalSince1970 * 1000 >= 800 else { throw ActionStopped(result: "expired") }
+                let error = AXUIElementSetAttributeValue(app, attributeName as CFString, kCFBooleanTrue)
+                note(stage, error.rawValue)
+                try check()
+            }
+        })
         note("native_target_pid", initial.pid)
         guard initial.pid == expectedPid else {
             return "focus_changed"
@@ -289,12 +369,17 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
             Thread.sleep(forTimeInterval: 0.025)
         }
         return ownerGone() ? "receiver_stopped" : "clipboard_timeout"
+    } catch let error as ActionStopped {
+        return error.result
     } catch is FocusChanged {
         // Only pre-dispatch focus checks throw here. Verification catches its
         // own errors and always reports an unconfirmed result after dispatch.
         return "focus_changed"
+    } catch let error as FocusReadFailure {
+        recordFocusFailure(error)
+        return "paste_failed"
     } catch let error as AXFailure {
-        note(error.stage, error.code.rawValue)
+        recordFocusFailure(error)
         return "paste_failed"
     } catch {
         note("native_exception", 0)
@@ -318,6 +403,115 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
     precondition(!insertionConfirmed("", "é", "e\u{301}"))
     precondition(insertionConfirmed("\u{FEFF}", "\u{FEFF}中文", "中文", emptyWorkBuddyPaste: "中文"))
     precondition(!insertionConfirmed("已有文字", "已有文字中文", "中文", emptyWorkBuddyPaste: "中文"))
+    // Pure initial-focus recovery checks: no AX calls and no paste dispatch.
+    let transientFocus = FocusReadFailure(app: AXFailure(stage: "ax_app_field", code: .noValue),
+                                         system: AXFailure(stage: "ax_system_field", code: .cannotComplete))
+    precondition(initialFocusCanRecover(transientFocus))
+    precondition(!initialFocusCanRecover(FocusReadFailure(
+        app: AXFailure(stage: "ax_app_field", code: .apiDisabled), system: transientFocus.system)))
+    precondition(!initialFocusCanRecover(FocusReadFailure(
+        app: AXFailure(stage: "ax_app_field", code: .invalidUIElement), system: transientFocus.system)))
+    precondition(!initialFocusCanRecover(FocusReadFailure(
+        app: AXFailure(stage: "ax_app_field", code: .cannotComplete),
+        system: AXFailure(stage: "ax_system_field", code: .apiDisabled))))
+    precondition(!initialFocusCanRecover(AXFailure(stage: "ax_window", code: .noValue)))
+    var focusReads = 0
+    var recoveries = 0
+    do {
+        let value = try captureInitialFocus(check: {}, read: { focusReads += 1; return "ready-input" },
+            recover: { _, _ in preconditionFailure("ready input must not initialize AX") },
+            pause: { preconditionFailure("ready input must not pause") })
+        precondition(value == "ready-input" && focusReads == 1)
+    } catch { preconditionFailure("ready input must succeed immediately") }
+    focusReads = 0
+    do {
+        let value = try captureInitialFocus(check: {}, read: {
+            focusReads += 1
+            if focusReads == 1 { throw transientFocus }
+            return "same-window-input"
+        }, recover: { _, check in recoveries += 1; try check() }, pause: {})
+        precondition(value == "same-window-input" && focusReads == 2 && recoveries == 1)
+    } catch { preconditionFailure("initial transient focus should recover") }
+    focusReads = 0; recoveries = 0
+    do {
+        let _: String = try captureInitialFocus(check: {}, read: {
+            focusReads += 1; throw transientFocus
+        }, recover: { _, _ in recoveries += 1 }, pause: {})
+        preconditionFailure("persistent focus failure must stop")
+    } catch is FocusReadFailure { precondition(focusReads == 2 && recoveries == 1) }
+    catch { preconditionFailure("original focus errors must be retained") }
+    for hardError in [AXError.apiDisabled, .invalidUIElement, .attributeUnsupported, .noValue] {
+        do {
+            let _: String = try captureInitialFocus(check: {}, read: {
+                throw AXFailure(stage: "ax_window", code: hardError)
+            }, recover: { _, _ in preconditionFailure("hard failures must not initialize AX") },
+                pause: { preconditionFailure("hard failures must not pause") })
+            preconditionFailure("hard focus failure must stop")
+        } catch let error as AXFailure { precondition(error.code == hardError) }
+        catch { preconditionFailure("hard error must be retained") }
+    }
+    for reason in ["expired", "receiver_stopped"] {
+        do {
+            let _: String = try captureInitialFocus(check: { throw ActionStopped(result: reason) },
+                read: { preconditionFailure("cancelled action must not read") },
+                recover: { _, _ in preconditionFailure("cancelled action must not initialize AX") })
+            preconditionFailure("cancelled action must stop")
+        } catch let error as ActionStopped { precondition(error.result == reason) }
+        catch { preconditionFailure("cancellation must be retained") }
+        var alive = true
+        focusReads = 0
+        do {
+            let _: String = try captureInitialFocus(check: {
+                if !alive { throw ActionStopped(result: reason) }
+            }, read: { focusReads += 1; throw transientFocus }, recover: { _, check in
+                alive = false; try check()
+                preconditionFailure("initialization must stop if action ends")
+            }, pause: { preconditionFailure("ended recovery must not pause") })
+            preconditionFailure("action ended during initialization must stop")
+        } catch let error as ActionStopped { precondition(error.result == reason && focusReads == 1) }
+        catch { preconditionFailure("initialization cancellation must be retained") }
+    }
+    var targetStable = true
+    focusReads = 0
+    do {
+        let _: String = try captureInitialFocus(check: { if !targetStable { throw FocusChanged() } },
+            read: { focusReads += 1; throw transientFocus }, recover: { _, _ in },
+            pause: { targetStable = false })
+        preconditionFailure("switched foreground must stop recovery")
+    } catch is FocusChanged { precondition(focusReads == 1) }
+    catch { preconditionFailure("focus change must be retained") }
+    focusReads = 0; recoveries = 0
+    do {
+        let _: String = try captureInitialFocus(check: {}, read: {
+            focusReads += 1
+            if focusReads == 1 { throw transientFocus }
+            throw FocusChanged() // Anchored window changed on the retry.
+        }, recover: { _, _ in recoveries += 1 }, pause: {})
+        preconditionFailure("switched window must stop recovery")
+    } catch is FocusChanged { precondition(focusReads == 2 && recoveries == 1) }
+    catch { preconditionFailure("window change must be retained") }
+    var focusClock = 0
+    do {
+        let _: String = try captureInitialFocus(check: {
+            if focusClock >= 100 { throw ActionStopped(result: "expired") }
+        }, read: { focusClock = 101; return "late-input" },
+            recover: { _, _ in preconditionFailure("late result must not initialize AX") })
+        preconditionFailure("late focus result must be rejected")
+    } catch let error as ActionStopped { precondition(error.result == "expired") }
+    catch { preconditionFailure("late focus cancellation must be retained") }
+    focusClock = 0
+    focusReads = 0
+    do {
+        let _: String = try captureInitialFocus(check: {
+            if focusClock >= 100 { throw ActionStopped(result: "expired") }
+        }, read: {
+            focusReads += 1
+            if focusReads == 1 { throw transientFocus }
+            focusClock = 101; return "late-recovered-input"
+        }, recover: { _, _ in }, pause: {})
+        preconditionFailure("late recovered focus result must be rejected")
+    } catch let error as ActionStopped { precondition(error.result == "expired" && focusReads == 2) }
+    catch { preconditionFailure("late recovery cancellation must be retained") }
     var testClock = 0.0
     var testReads = 0
     let recovered = waitForInsertion(before: "", expected: "pasted", emptyWorkBuddyPaste: nil,
@@ -342,7 +536,7 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
         deadline: 200, ownerAlive: { true }, read: { testClock = 201; return "pasted" },
         now: { testClock }, pause: { preconditionFailure("late read must stop") })
     precondition(!lateRead.verified)
-    print("pure guard/hash/insertion checks passed; no AX or clipboard access")
+    print("pure guard/hash/focus-recovery/insertion checks passed; no AX or clipboard access")
 } else if CommandLine.arguments.count == 5, let deadline = Double(CommandLine.arguments[1]),
           deadline.isFinite, let owner = Int32(CommandLine.arguments[3]), owner > 1,
           let expectedPid = Int32(CommandLine.arguments[4]), expectedPid > 1,

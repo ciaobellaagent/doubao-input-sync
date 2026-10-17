@@ -66,6 +66,8 @@ The button copies immediately and can wait up to 15 seconds for preparation. Edi
 
 An executed receipt clears only the unchanged submitted draft and saves local recovery. Failed or unknown results preserve it. **Receipts have different strengths:** the native path verifies inserted text; the ordinary System Events path only confirms that the shortcut was dispatched. If the phone reports failure after text appeared, inspect the target before retrying to avoid duplicates.
 
+Ordinary apps use system focus and standard Command-V without per-app or website configuration. The native fallback reads the standard application role before resolving the actual focused input, allowing on-demand accessibility providers to prepare their interface. Its V key-up event carries no modifier flags; all three modifier checkpoints check AppKit, session and hardware state. Validate each intended application: these generic mechanisms do not establish compatibility with every editor.
+
 **WorkBuddy compatibility exception:** WorkBuddy uses its native Edit → Paste menu (`paste:` through accessibility). Other supported apps use simulated Command-V. This is an explicit app-specific route, not proof that keyboard paste cannot work in WorkBuddy. See [Mac receiver details](docs/PREARMED_RECEIVER.md).
 
 ## Other desktop options

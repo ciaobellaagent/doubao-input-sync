@@ -147,12 +147,19 @@ func initialFocusCanRetry(_ error: Error) -> Bool {
     return failure.code == .cannotComplete &&
         ["ax_window", "ax_window_recheck", "ax_app_field", "ax_system_field"].contains(failure.stage)
 }
-// Only initial discovery may re-read AX. Callbacks do not change app state or paste.
-// Keep this injectable so retry, cancellation and late results can be tested
+// Only initial discovery may re-read AX. There are no AX attribute writes or
+// input dispatch; standard metadata reads may initialize a provider's interface.
+// Keep callbacks injectable so preparation, retry and cancellation can be tested
 // without reading any application, clipboard or accessibility permissions.
-func captureInitialFocus<T>(check: () throws -> Void, read: () throws -> T,
+func captureInitialFocus<T>(check: () throws -> Void,
+                            prepare: () throws -> Void = {}, read: () throws -> T,
                             onRetry: (Error) throws -> Void,
                             pause: () -> Void = { Thread.sleep(forTimeInterval: 0.025) }) throws -> T {
+    try check()
+    // A standard application-role query lets on-demand accessibility providers
+    // prepare their native interface. Perform it once, before focus discovery;
+    // permission/type failures cannot enter the focus retry path.
+    try prepare()
     try check()
     do {
         let result = try read()
@@ -349,6 +356,12 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
             guard !expired() else { throw ActionStopped(result: "expired") }
             guard !ownerGone() else { throw ActionStopped(result: "receiver_stopped") }
             guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { throw FocusChanged() }
+        }, prepare: {
+            let role = try attribute(app, kAXRoleAttribute, "ax_app_role")
+            guard let role = role as? String, role == kAXApplicationRole else {
+                throw AXFailure(stage: "ax_app_role_type", code: .illegalArgument)
+            }
+            note("ax_app_role_checked", 0)
         }, read: {
             try focus(system, expectedPid, observeWindow: { window in
                 if let captured = initialWindow, !CFEqual(captured, window) { throw FocusChanged() }
@@ -562,6 +575,59 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
     // Pure initial-focus recovery checks: no AX calls and no paste dispatch.
     let transientFocus = FocusReadFailure(app: AXFailure(stage: "ax_app_field", code: .noValue),
                                          system: AXFailure(stage: "ax_system_field", code: .cannotComplete))
+    // Discovery preparation happens once even when the focused element needs
+    // a transient retry; it never dispatches a key or mutates AX attributes.
+    var preparationCount = 0
+    var preparedReads = 0
+    do {
+        let value = try captureInitialFocus(check: {}, prepare: { preparationCount += 1 }, read: {
+            precondition(preparationCount == 1)
+            preparedReads += 1
+            if preparedReads == 1 { throw transientFocus }
+            return "prepared-input"
+        }, onRetry: { _ in }, pause: {})
+        precondition(value == "prepared-input" && preparationCount == 1 && preparedReads == 2)
+    } catch { preconditionFailure("one preparation must precede initial and retried focus reads") }
+    for code in [AXError.apiDisabled, .cannotComplete, .illegalArgument] {
+        do {
+            let _: String = try captureInitialFocus(check: {}, prepare: {
+                throw AXFailure(stage: "ax_app_role", code: code)
+            }, read: { preconditionFailure("failed application-role read must stop before focus") },
+                onRetry: { _ in preconditionFailure("preparation must never be retried") },
+                pause: { preconditionFailure("preparation failure must not pause") })
+            preconditionFailure("application-role failure must stop")
+        } catch let error as AXFailure { precondition(error.stage == "ax_app_role" && error.code == code) }
+        catch { preconditionFailure("application-role error must be retained") }
+    }
+    var preparationStable = true
+    do {
+        let _: String = try captureInitialFocus(check: {
+            if !preparationStable { throw FocusChanged() }
+        }, prepare: { preparationStable = false },
+            read: { preconditionFailure("focus change during preparation must stop before discovery") },
+            onRetry: { _ in preconditionFailure("focus change must not retry preparation") })
+        preconditionFailure("changed focus after preparation must stop")
+    } catch is FocusChanged {} catch { preconditionFailure("focus change must be retained") }
+    for reason in ["expired", "receiver_stopped"] {
+        var preparationEnded = false
+        do {
+            let _: String = try captureInitialFocus(check: {
+                if preparationEnded { throw ActionStopped(result: reason) }
+            }, prepare: { preparationEnded = true },
+                read: { preconditionFailure("action ended during preparation must not discover focus") },
+                onRetry: { _ in preconditionFailure("ended preparation must not retry") })
+            preconditionFailure("ended preparation must stop")
+        } catch let error as ActionStopped { precondition(error.result == reason) }
+        catch { preconditionFailure("preparation cancellation must be retained") }
+        do {
+            let _: String = try captureInitialFocus(check: { throw ActionStopped(result: reason) },
+                prepare: { preconditionFailure("cancelled action must not prepare accessibility") },
+                read: { preconditionFailure("cancelled action must not discover focus") },
+                onRetry: { _ in preconditionFailure("cancelled preparation must not retry") })
+            preconditionFailure("cancelled action must stop before preparation")
+        } catch let error as ActionStopped { precondition(error.result == reason) }
+        catch { preconditionFailure("initial cancellation must be retained") }
+    }
     precondition(initialFocusCanRetry(transientFocus))
     precondition(!initialFocusCanRetry(FocusReadFailure(
         app: AXFailure(stage: "ax_app_field", code: .apiDisabled), system: transientFocus.system)))

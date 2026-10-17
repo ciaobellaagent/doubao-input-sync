@@ -29,11 +29,8 @@ on run argv
             set targetPid to my frontmostPid()
             my progress("as_start", 0)
             my recordFailure("workspace_target_pid", targetPid)
-            my progress("as_legacy_lookup", 0)
-            try
-                set legacyPid to unix id of first application process whose frontmost is true
-                if legacyPid is not targetPid then my recordFailure("system_events_disagrees_pid", legacyPid)
-            end try
+            -- NSWorkspace already selected the authoritative PID. Avoid a
+            -- second, diagnostic-only frontmost lookup on the paste deadline.
             my progress("as_process_lookup", 0)
             set targetProcess to first application process whose unix id is targetPid
             my progress("as_bundle_lookup", 0)

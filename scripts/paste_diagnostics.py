@@ -1,15 +1,21 @@
 """Bounded metadata tracing. This module has no input or application capability.
 
-Importing is side-effect free. ``trace`` opens its private log lazily, drops
-unknown fields/values, and never lets a diagnostic failure escape to the caller.
+Importing is side-effect free. ``trace`` only validates, serializes and offers a
+record to a bounded queue; a single daemon owns all file I/O. A stalled writer
+can lose diagnostics, but cannot hold an action/poll thread on its file locks.
+Unknown fields/values are dropped and diagnostic errors never escape callers.
 ``action_context`` only correlates work in the current thread; it does not
 authorize an action. Dispatch intent/return records do not prove insertion.
+Accepted records retain their original sink after enable/disable. Process exit
+may lose the daemon's remaining records; explicit ``flush(timeout)`` is bounded
+and is intended for tests or closeout, never the action/poll path.
 """
 from contextlib import contextmanager
 import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import stat
 import threading
@@ -23,6 +29,9 @@ LOG_PATH = DEFAULT_LOG_PATH
 MAX_LOG_BYTES = 2 * 1024 * 1024
 LOG_FILE_COUNT = 3  # Active file plus .1 and .2, newest first.
 MAX_LINE_BYTES = 1024  # The terminating newline is included; strictly less.
+MAX_QUEUE_RECORDS = 256  # Plus one record currently held by the writer.
+_WRITER_METADATA_RESERVE = 80
+_MAX_DROPPED = 2147483647
 
 EVENTS = frozenset({
     "control", "action_received", "action_start", "action_duplicate", "lock_wait",
@@ -83,30 +92,124 @@ _INTEGER_FIELDS = {
 _UUID_PATTERN = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z")
 _SHA_PATTERN = re.compile(r"[0-9a-fA-F]{64}\Z")
 _CONTEXT = thread_context()
-_WRITE_LOCK = threading.Lock()
+_CONFIG_LOCK = threading.Lock()  # Never acquired by trace or the writer.
 _ENABLED = False
+_ACTIVE = None
+_WRITER = None
+
+
+class _Sink:
+    def __init__(self, path, writer):
+        self.path = path  # Captured per generation; never read LOG_PATH in I/O.
+        self.writer = writer
+        self.dropped = 0  # Accessed only under the short queue mutex.
+
+
+class _TraceQueue(queue.Queue):
+    def put_nowait(self, item):
+        # Queue coordination never includes serialization or file operations.
+        # Count a full queue while holding the same short lock as its size test.
+        with self.not_full:
+            if self._qsize() >= self.maxsize:
+                item[0].dropped = min(_MAX_DROPPED, item[0].dropped + 1)
+                raise queue.Full
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def drop(self, sink):
+        with self.mutex:
+            sink.dropped = min(_MAX_DROPPED, sink.dropped + 1)
+
+    def dropped(self, sink):
+        with self.mutex:
+            return sink.dropped
+
+
+def _encode(record):
+    return (json.dumps(record, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
+
+
+class _Writer:
+    def __init__(self):
+        self.queue = _TraceQueue(MAX_QUEUE_RECORDS)
+        self.origin = time.monotonic()
+        self.thread = threading.Thread(target=self.run, name="paste-diagnostics", daemon=True)
+
+    def run(self):
+        while True:
+            sink, line, produced = self.queue.get()
+            try:
+                record = json.loads(line)
+                # Producer timestamps describe the event. This separate value
+                # shows queue/scheduling delay before I/O, capped at ten minutes.
+                record["writer_delay_ms"] = round(min(600000, max(0, (time.monotonic() - produced) * 1000)), 3)
+                dropped = self.queue.dropped(sink)
+                if dropped:
+                    record["dropped_records"] = dropped
+                enriched = _encode(record)
+                if len(enriched) >= MAX_LINE_BYTES or not _write_line(enriched, sink.path):
+                    self.queue.drop(sink)
+            except Exception:
+                # Failed records are discarded once. Never recurse into trace,
+                # retain an exception, retry an action, or enqueue a retry.
+                self.queue.drop(sink)
+            finally:
+                self.queue.task_done()
 
 
 def enable(path=None):
-    """Enable this process's sink explicitly, without opening or creating it."""
-    global LOG_PATH, _ENABLED
-    with _WRITE_LOCK:
+    """Enable a new sink generation, lazily; no file is opened on this thread."""
+    global LOG_PATH, _ENABLED, _ACTIVE, _WRITER
+    with _CONFIG_LOCK:
         _ENABLED = False
+        _ACTIVE = None
         try:
             destination = DEFAULT_LOG_PATH if path is None else Path(path)
             if not destination.is_absolute():
                 return
+            if _WRITER is None:
+                writer = _Writer()
+                writer.thread.start()
+                _WRITER = writer
             LOG_PATH = destination
+            _ACTIVE = _Sink(destination, _WRITER)
             _ENABLED = True
         except Exception:
             pass
 
 
 def disable():
-    """Stop diagnostic writes, including from imported receiver test fixtures."""
-    global _ENABLED
-    with _WRITE_LOCK:
+    """Stop accepting records immediately; accepted records keep their old sink."""
+    global _ENABLED, _ACTIVE
+    with _CONFIG_LOCK:
         _ENABLED = False
+        _ACTIVE = None
+
+
+def flush(timeout=1.0):
+    """Wait up to timeout seconds for accepted records to be attempted once.
+
+    True means the queue drained, not that writes succeeded. This explicit wait
+    is never used by trace, enable or disable. No indefinite joins or fsyncs.
+    """
+    try:
+        if type(timeout) not in {int, float} or not math.isfinite(timeout) or not 0 <= timeout <= 30:
+            return False
+        writer = _WRITER
+        if writer is None:
+            return True
+        deadline = time.monotonic() + timeout
+        pending = writer.queue
+        with pending.all_tasks_done:
+            while pending.unfinished_tasks:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                pending.all_tasks_done.wait(remaining)
+        return True
+    except Exception:
+        return False
 
 
 def _action_id(value):
@@ -217,10 +320,10 @@ def _regular_file(directory_fd, name, writable=False, create=False):
         raise
 
 
-def _write_line(line):
+def _write_line(line, path):
     if len(line) >= MAX_LINE_BYTES or len(line) > MAX_LOG_BYTES:
-        return
-    path = Path(LOG_PATH)
+        return False
+    path = Path(path)
     directory_fd = _secure_directory(path.parent)
     file_fd = None
     try:
@@ -255,6 +358,8 @@ def _write_line(line):
         # JSON line for the next append by this process-local writer.
         if os.write(file_fd, line) != len(line):
             os.ftruncate(file_fd, size)
+            return False
+        return True
     finally:
         if file_fd is not None:
             os.close(file_fd)
@@ -262,17 +367,20 @@ def _write_line(line):
 
 
 def trace(event, **fields):
-    """Best-effort fixed-schema JSONL trace; diagnostics never escape or act."""
+    """Offer bounded metadata without waiting for any writer file I/O/lock."""
     try:
-        if not _ENABLED or type(event) is not str or event not in EVENTS:
+        sink = _ACTIVE
+        if sink is None or type(event) is not str or event not in EVENTS:
             return
-        record = {"event": event, "at": round(time.time(), 3), **_metadata(fields)}
-        line = (json.dumps(record, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
-        if len(line) >= MAX_LINE_BYTES:
+        produced = time.monotonic()
+        record = {"event": event, "at": round(time.time(), 3),
+                  "mono_ms": round(max(0, (produced - sink.writer.origin) * 1000), 3), **_metadata(fields)}
+        line = _encode(record)
+        if len(line) + _WRITER_METADATA_RESERVE >= MAX_LINE_BYTES:
             return
-        with _WRITE_LOCK:
-            if _ENABLED:
-                _write_line(line)
+        sink.writer.queue.put_nowait((sink, line, produced))
+    except queue.Full:
+        pass  # Counted by the queue, reported after the writer recovers.
     except Exception:
         # No arbitrary error text is retained or printed, and no fallback acts.
         pass

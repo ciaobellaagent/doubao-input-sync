@@ -86,3 +86,17 @@ These diagnostics do not extend action deadlines, change the selected paste
 route or retry uncertain paste commands. Pure subprocess tests cover timeout
 before/after dispatch markers without operating the desktop. Real input-method
 and target-app insertion still require their own acceptance.
+
+Python receiver diagnostic writes use a bounded background queue. The action and poll threads
+never wait for file writes; a full queue drops diagnostic records and reports a
+bounded drop count after recovery. Producer timestamps include a monotonic clock
+so scheduling and wall-clock adjustments can be distinguished from writing delay.
+Queued records may be lost when the process exits; this is best-effort tracing,
+not a durable execution receipt. Native-helper file logging remains separate.
+The extra System Events frontmost query used only to compare diagnostic PIDs has
+been removed. NSWorkspace remains the target source; all exact field/window,
+clipboard, modifier and deadline guards remain.
+
+A conservative budget still subtracts the entire poll duration, including server
+waiting. These latency changes do not alter that protocol rule or the five-second
+server lifetime. They cannot guarantee paste when the desktop is heavily loaded.

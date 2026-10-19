@@ -28,7 +28,7 @@ from paste_diagnostics import action_context, current_action_id, trace, STAGES, 
 HERE = Path(__file__).resolve().parent
 PROTOCOL = "clipboard-match-v1"
 MAX_ACTIONS_PER_SESSION = 256
-MATCH_REASONS = REASONS | {"clipboard_timeout", "clipboard_changed", "mismatch"}
+MATCH_REASONS = REASONS | {"clipboard_timeout", "clipboard_changed", "mismatch", "paste_unconfirmed"}
 
 
 # Keep response diagnostics machine-readable without retaining arbitrary server
@@ -103,6 +103,27 @@ class ControlApi(Api):
 
 def valid_hash(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def acknowledge_result(api, receipt, stopped=lambda: False):
+    """Retry the fixed receipt only; this function cannot execute an action."""
+    for attempt in range(2):
+        trace("ack_start")
+        try:
+            api.request("ack", receipt)
+            trace("ack_end", outcome="ok")
+            return
+        except ControlApiError as error:
+            if error.http_status == 409 and error.error_code == "action_already_finished":
+                # An observation conflict is not a lost receiver lease. Preserve
+                # the server's result instead of rotating away its history.
+                trace("ack_end", outcome="http_error", http_status=409,
+                      error_code=error.error_code)
+                return
+            raise
+        except (ApiError, subprocess.TimeoutExpired):
+            if attempt or stopped():
+                raise
 
 
 def read_clipboard_hash():
@@ -443,9 +464,7 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                         ack = {**identity, "action_id": action_id, "status": status}
                         if reason:
                             ack["reason"] = reason
-                        trace("ack_start")
-                        api.request("ack", ack)
-                        trace("ack_end", outcome="ok")
+                        acknowledge_result(api, ack, lambda: stopped() or session_lost.is_set())
                 emit("session_ready", room=room, protocol=PROTOCOL)
                 while not stopped():
                     if job and job.done():

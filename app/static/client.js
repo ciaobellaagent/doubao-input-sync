@@ -54,6 +54,7 @@
     signalQueueTimer: null,
     signalActionId: null,
     signalActionPending: false,
+    signalActionLate: false,
     signalActionDraft: null,
     signalActionTimer: null,
     signalPageActive: true,
@@ -418,6 +419,7 @@
   function finishSignalAction(id, message, status = "error") {
     if (state.signalActionId !== id || !state.signalActionPending) return;
     state.signalActionPending = false;
+    state.signalActionLate = false;
     state.signalActionDraft = null;
     window.clearTimeout(state.signalActionTimer);
     state.signalActionTimer = null;
@@ -444,7 +446,21 @@
   };
 
   function showSignalAction(action) {
-    if (!action || action.action_id !== state.signalActionId || !state.signalActionPending) return;
+    if (!action || action.action_id !== state.signalActionId) return;
+    if (!state.signalActionPending) {
+      // A readback after the observation timeout may update the message only.
+      // The retained/re-edited draft is no longer eligible for automatic clear.
+      if (state.signalActionLate && ["executed", "cancelled", "expired"].includes(action.status)) {
+        state.signalActionLate = false;
+        signalActionStatus.textContent = action.status === "executed"
+          ? "已补收到执行回执 · 草稿已保留，请核对电脑，避免重复粘贴"
+          : action.reason === "paste_unconfirmed"
+            ? "电脑已调用粘贴，但未能确认文字写入 · 草稿已保留，请先检查电脑，避免重复粘贴"
+            : "已补收到回执，粘贴结果未确认 · 草稿已保留，请先检查电脑再重试";
+        signalActionStatus.dataset.status = action.status === "executed" ? "saved" : "error";
+      }
+      return;
+    }
     if (action.status === "executed") {
       const draft = state.signalActionDraft;
       const canClear = draft && state.role === "mobile" && state.captureMode === "clipboard" &&
@@ -462,8 +478,10 @@
       finishSignalAction(action.action_id, canClear
         ? "粘贴指令已执行 · 手机输入已清空，可恢复刚才内容"
         : "粘贴指令已执行 · 新输入已保留，请核对电脑里的文字", "saved");
-    } else if (action.status === "expired") {
+    } else if (action.status === "expired" || (action.status === "cancelled" && action.reason === "expired")) {
       finishSignalAction(action.action_id, "指令已过期，执行结果未确认 · 草稿已保留；请先检查电脑，未粘贴可切换换气发送");
+    } else if (action.status === "cancelled" && action.reason === "paste_unconfirmed") {
+      finishSignalAction(action.action_id, "电脑已调用粘贴，但未能确认文字写入 · 草稿已保留，请先检查电脑，避免重复粘贴");
     } else if (action.status === "cancelled" && action.reason === "paste_failed") {
       finishSignalAction(action.action_id, "粘贴结果未确认 · 草稿已保留，不会自动重发；请先检查电脑，确认没有粘贴后再重试或切换换气发送");
     } else if (action.status === "cancelled") {
@@ -569,11 +587,13 @@
     invalidatePreparation();
     state.signalActionId = actionId;
     state.signalActionPending = true;
+    state.signalActionLate = false;
     state.signalActionDraft = queued;
     signalActionStatus.textContent = "电脑已就绪 · 正在发送一次粘贴指令…";
     signalActionStatus.dataset.status = "pending";
     state.signalActionTimer = window.setTimeout(function () {
       finishSignalAction(actionId, "粘贴结果未知，不会重发 · 草稿已保留；请先检查电脑，未粘贴可切换换气发送");
+      state.signalActionLate = state.signalActionId === actionId;
     }, 15000);
     void sendSignalAction(actionId, sessionId, preparation.preparation_id);
     updateManualSendAvailability();

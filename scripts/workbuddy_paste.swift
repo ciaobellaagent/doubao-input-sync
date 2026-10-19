@@ -362,16 +362,24 @@ func insertionConfirmed(_ before: String, _ expected: String, _ actual: String, 
 func waitForInsertion(before: String, expected: String, emptyWorkBuddyPaste: String?,
                       deadline: Double, ownerAlive: () -> Bool, read: () throws -> String,
                       now: () -> Double = { Date().timeIntervalSince1970 * 1000 },
-                      pause: () -> Void = { Thread.sleep(forTimeInterval: 0.025) }) -> (verified: Bool, failure: AXFailure?) {
+                      pause: () -> Void = { Thread.sleep(forTimeInterval: 0.025) },
+                      observe: (Int32) -> Void = { _ in }) -> (verified: Bool, failure: AXFailure?) {
     var lastFailure: AXFailure?
+    // Fixed categories only: no read, unchanged, changed unexpectedly, read
+    // error, exact match. Timeliness is checked separately. No text or lengths.
+    var observation: Int32 = 0
+    defer { observe(observation) }
     while now() < deadline && ownerAlive() {
         do {
             let actual = try read()
             lastFailure = nil
+            observation = before.utf16.elementsEqual(actual.utf16) ? 1 : 2
             if insertionConfirmed(before, expected, actual, emptyWorkBuddyPaste: emptyWorkBuddyPaste) {
+                observation = 4
                 return (now() < deadline && ownerAlive(), nil)
             }
         } catch let error as AXFailure {
+            observation = 3
             lastFailure = error
             // Electron can temporarily stop responding during the menu action.
             // Retry this read only, without changing target or posting again.
@@ -514,20 +522,20 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
                 note("native_verify_begin", 0)
                 AXUIElementSetMessagingTimeout(initial.field, 0.1)
                 let confirmation = waitForInsertion(before: before.text, expected: expected,
-                    emptyWorkBuddyPaste: isWorkBuddy ? text : nil, deadline: deadline,
+                    emptyWorkBuddyPaste: isWorkBuddy ? text : nil, deadline: deadline - 200,
                     ownerAlive: { !ownerGone() }, read: {
                         if try roleCheck(initial.field) != nil {
                             throw AXFailure(stage: "verify_target_changed", code: .illegalArgument)
                         }
                         return try fieldText(initial.field)
-                    })
+                    }, observe: { note("verify_observation", $0) })
                 if confirmation.verified {
                     note("paste_verified", 0)
                     return "executed"
                 }
                 if let failure = confirmation.failure { note(failure.stage, failure.code.rawValue) }
                 note("paste_unconfirmed", 0)
-                return "paste_failed"
+                return "paste_unconfirmed"
             }
             Thread.sleep(forTimeInterval: 0.025)
         }
@@ -857,8 +865,13 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
     precondition(recovered.verified && testReads == 2)
     let timedOut = waitForInsertion(before: "", expected: "pasted", emptyWorkBuddyPaste: nil,
         deadline: 100, ownerAlive: { true }, read: { "" },
-        now: { testClock }, pause: { testClock += 25 })
+        now: { testClock }, pause: { testClock += 25 }, observe: { precondition($0 == 1) })
     precondition(!timedOut.verified && testClock == 100)
+    testClock = 0
+    let transformed = waitForInsertion(before: "", expected: "pasted", emptyWorkBuddyPaste: nil,
+        deadline: 100, ownerAlive: { true }, read: { "different" },
+        now: { testClock }, pause: { testClock += 25 }, observe: { precondition($0 == 2) })
+    precondition(!transformed.verified)
     let ownerStopped = waitForInsertion(before: "", expected: "pasted", emptyWorkBuddyPaste: nil,
         deadline: 200, ownerAlive: { false }, read: { preconditionFailure("must not read after owner exits") }, now: { 100 })
     precondition(!ownerStopped.verified)

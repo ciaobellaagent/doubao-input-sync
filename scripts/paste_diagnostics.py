@@ -47,7 +47,7 @@ OUTCOMES = frozenset({
 REASONS = frozenset({
     "focus_changed", "no_focused_input", "unsafe_target", "expired", "receiver_stopped",
     "paste_failed", "receiver_expired", "receiver_unregistered", "permission_missing",
-    "modifier_held", "superseded", "clipboard_timeout", "clipboard_changed", "mismatch",
+    "modifier_held", "superseded", "clipboard_timeout", "clipboard_changed", "mismatch", "paste_unconfirmed",
 })
 ERROR_CODES = frozenset({
     "preparation_mismatch", "session_mismatch", "receiver_token_invalid",

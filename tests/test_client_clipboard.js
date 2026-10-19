@@ -870,6 +870,39 @@ test('executed receipt after observation timeout cannot clear a retained draft',
   await env.runTimeout(15000);
   env.controls.signalAction = { action_id: signals(env)[0].body.action_id, status: 'executed' }; await env.tick(2000);
   assert.equal(env.get('mobile-editor').value, '未知时保留');
+  assert.match(env.get('signal-action-status').textContent, /已补收到执行回执/);
+  assert.equal(signals(env).length, 1);
+});
+
+test('unconfirmed dispatch reports its evidence and retains the exact draft', async () => {
+  const env = boot(); await settle(); env.input('已调用但不能证明写入'); await env.prepare();
+  env.click('copy-paste-button'); await settle();
+  const id = signals(env)[0].body.action_id;
+  env.controls.signalAction = { action_id: id, status: 'cancelled', reason: 'paste_unconfirmed' };
+  await env.tick(2000);
+  assert.match(env.get('signal-action-status').textContent, /电脑已调用粘贴，但未能确认文字写入/);
+  assert.equal(env.get('mobile-editor').value, '已调用但不能证明写入');
+  assert.equal(signals(env).length, 1);
+});
+
+test('receiver deadline cancellation cannot claim the paste did not happen', async () => {
+  const env = boot(); await settle(); env.input('监督器超时保留'); await env.prepare();
+  env.click('copy-paste-button'); await settle();
+  env.controls.signalAction = { action_id: signals(env)[0].body.action_id, status: 'cancelled', reason: 'expired' };
+  await env.tick(2000);
+  assert.match(env.get('signal-action-status').textContent, /执行结果未确认/);
+  assert.equal(env.get('mobile-editor').value, '监督器超时保留');
+});
+
+test('late receipt after reconnect preserves newer typing and never sends another action', async () => {
+  const env = boot(); await settle(); env.input('原内容'); await env.prepare();
+  env.click('copy-paste-button'); await settle(); const id = signals(env)[0].body.action_id;
+  await env.runTimeout(15000); env.input('新的草稿');
+  env.controls.signalSession = 'new-receiver-session';
+  env.controls.signalAction = { action_id: id, status: 'executed' }; await env.tick(2000);
+  assert.match(env.get('signal-action-status').textContent, /已补收到执行回执/);
+  assert.equal(env.get('mobile-editor').value, '新的草稿');
+  assert.equal(signals(env).length, 1);
 });
 
 test('click before preparation copies immediately and queues exactly one action until matching ready', async () => {

@@ -26,7 +26,7 @@ ACK_REASONS = frozenset({
     "focus_changed", "no_focused_input", "unsafe_target", "expired",
     "receiver_stopped", "paste_failed", "receiver_expired",
     "receiver_unregistered", "permission_missing", "modifier_held", "superseded",
-    "clipboard_timeout", "clipboard_changed", "mismatch",
+    "clipboard_timeout", "clipboard_changed", "mismatch", "paste_unconfirmed",
 })
 TERMINAL_STATUSES = frozenset({"executed", "cancelled", "expired"})
 _INIT_LOCK = threading.Lock()
@@ -82,6 +82,7 @@ class Action:
     sha256: str | None = None
     status: str = "accepted"
     reason: str | None = None
+    receipt_deadline: float | None = None
 
     def public(self) -> dict:
         result = {"action_id": self.action_id, "status": self.status}
@@ -108,25 +109,32 @@ class SignalStore:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic,
                  poll_seconds: float = 1.0, lease_seconds: float = 6.0,
                  action_seconds: float = 5.0, max_actions: int = 256,
-                 max_rooms: int = 128):
+                 max_rooms: int = 128, receipt_seconds: float = 10.0,
+                 history_seconds: float = 120.0, max_previous_sessions: int = 4):
         self.clock = clock
         self.poll_seconds = min(max(poll_seconds, 0.0), 1.0)
         self.lease_seconds = lease_seconds
         self.action_seconds = action_seconds
         self.max_actions = max_actions
         self.max_rooms = max_rooms
+        self.receipt_seconds = receipt_seconds
+        self.history_seconds = history_seconds
+        self.max_previous_sessions = max_previous_sessions
         self.rooms: dict[str, Session] = {}
+        # Readback/ACK only. A retained session can never authorize another paste.
+        self.previous: dict[str, list[tuple[float, Session]]] = {}
         self.changed = threading.Condition()
 
     def _expire(self, session: Session) -> None:
         now = self.clock()
         if session.preparation and now >= session.preparation.deadline:
             session.preparation = None
-        if session.outstanding_id is not None:
-            action = session.actions[session.outstanding_id]
-            if now >= action.deadline:
+        for action in session.actions.values():
+            cutoff = action.receipt_deadline if action.status == "delivered" else action.deadline
+            if action.status in {"accepted", "delivered"} and now >= cutoff:
                 action.status, action.reason = "expired", "expired"
-                session.outstanding_id = None
+                if session.outstanding_id == action.action_id:
+                    session.outstanding_id = None
         if session.active and now - session.last_poll_completed >= self.lease_seconds:
             self._close(session, "receiver_expired")
 
@@ -134,7 +142,8 @@ class SignalStore:
         session.active = False
         if session.outstanding_id is not None:
             action = session.actions[session.outstanding_id]
-            action.status, action.reason = "cancelled", reason
+            if action.status == "accepted":
+                action.status, action.reason = "cancelled", reason
             session.outstanding_id = None
         self.changed.notify_all()
 
@@ -155,6 +164,28 @@ class SignalStore:
             raise SignalError("receiver_token_invalid", HTTPStatus.FORBIDDEN)
         return session
 
+    def _previous(self, room: str) -> list[Session]:
+        now = self.clock()
+        retained = [(until, session) for until, session in self.previous.get(room, []) if now < until]
+        if retained:
+            self.previous[room] = retained
+        else:
+            self.previous.pop(room, None)
+        for _, session in retained:
+            self._expire(session)
+        return [session for _, session in retained]
+
+    def _receipt_receiver(self, room: str, session_id: str, token: str) -> Session:
+        session = self.rooms.get(room)
+        candidates = ([session] if session else []) + self._previous(room)
+        for candidate in candidates:
+            if candidate.session_id == session_id:
+                self._expire(candidate)
+                if not secrets.compare_digest(candidate.receiver_token, token):
+                    raise SignalError("receiver_token_invalid", HTTPStatus.FORBIDDEN)
+                return candidate
+        raise SignalError("session_mismatch", HTTPStatus.CONFLICT)
+
     def register(self, room: str, protocol: str = LEGACY_PROTOCOL) -> dict:
         if not isinstance(protocol, str) or protocol not in {LEGACY_PROTOCOL, MATCH_PROTOCOL}:
             raise SignalError("invalid_protocol")
@@ -167,12 +198,26 @@ class SignalStore:
             if prior is None and len(self.rooms) >= self.max_rooms:
                 for key, candidate in list(self.rooms.items()):
                     self._expire(candidate)
-                    if not candidate.active and not candidate.polling:
+                    retained = self._previous(key)
+                    awaiting_receipt = any(a.status == "delivered"
+                                           for old in [candidate, *retained] for a in old.actions.values())
+                    if not candidate.active and not candidate.polling and not awaiting_receipt:
                         del self.rooms[key]
+                        self.previous.pop(key, None)
                         break
                 if len(self.rooms) >= self.max_rooms:
                     raise SignalError("signal_capacity_reached", HTTPStatus.TOO_MANY_REQUESTS)
             session = Session(str(uuid4()), secrets.token_urlsafe(32), self.clock(), protocol=protocol)
+            self._previous(room)
+            if prior is not None:
+                retained = self.previous.setdefault(room, [])
+                if len(retained) >= self.max_previous_sessions:
+                    removable = next((index for index, (_, old) in enumerate(retained)
+                                      if not any(a.status == "delivered" for a in old.actions.values())), None)
+                    if removable is None:
+                        raise SignalError("signal_capacity_reached", HTTPStatus.TOO_MANY_REQUESTS)
+                    del retained[removable]
+                retained.append((self.clock() + self.history_seconds, prior))
             self.rooms[room] = session
             self.changed.notify_all()
             return {"ok": True, "session_id": session.session_id, "receiver_token": session.receiver_token, "protocol": session.protocol}
@@ -184,6 +229,9 @@ class SignalStore:
                 return {"ok": True, "ready": False, "session_id": None, "action": None}
             self._expire(session)
             action = session.actions.get(action_id if action_id is not None else session.latest_id)
+            if action is None and action_id is not None:
+                action = next((old.actions[action_id] for old in reversed(self._previous(room))
+                               if action_id in old.actions), None)
             return {"ok": True, "ready": session.active,
                     "session_id": session.session_id if session.active else None,
                     "action": action.public() if action is not None else None,
@@ -230,6 +278,8 @@ class SignalStore:
                 if existing.preparation_id != preparation_id:
                     raise SignalError("action_id_conflict", HTTPStatus.CONFLICT)
                 return {"ok": True, "session_id": session_id, "action": existing.public()}
+            if any(action_id in old.actions for old in self._previous(room)):
+                raise SignalError("action_id_conflict", HTTPStatus.CONFLICT)
             if len(session.actions) >= self.max_actions:
                 raise SignalError("action_limit_reached", HTTPStatus.CONFLICT)
             if session.outstanding_id is not None:
@@ -266,6 +316,9 @@ class SignalStore:
                         remaining_ms = math.floor((action.deadline - self.clock()) * 1000)
                         if remaining_ms > 0:
                             action.status = "delivered"
+                            # The original deadline still bounds dispatch on the
+                            # receiver. This allowance accepts results only.
+                            action.receipt_deadline = action.deadline + self.receipt_seconds
                             return {"ok": True, "session_id": session_id, "action": {
                                 "action_id": action.action_id, "session_id": session_id,
                                 "remaining_ms": remaining_ms,
@@ -291,7 +344,7 @@ class SignalStore:
     def ack(self, room: str, session_id: str, token: str, action_id: str,
             status: str, reason: str | None = None) -> dict:
         with self.changed:
-            session = self._receiver(room, session_id, token)
+            session = self._receipt_receiver(room, session_id, token)
             action = session.actions.get(action_id)
             if action is None:
                 raise SignalError("action_unknown", HTTPStatus.NOT_FOUND)
@@ -302,7 +355,8 @@ class SignalStore:
                 raise SignalError("action_not_delivered", HTTPStatus.CONFLICT)
             else:
                 action.status, action.reason = status, reason
-                session.outstanding_id = None
+                if session.outstanding_id == action_id:
+                    session.outstanding_id = None
                 self.changed.notify_all()
             return {"ok": True, "session_id": session_id, "action": action.public()}
 

@@ -107,11 +107,69 @@ class SignalStoreTests(unittest.TestCase):
                 self.clock.now += 5
                 status = self.store.status(self.room, action_id)
                 self.assertTrue(status["ready"])
+                if delivered:
+                    self.assertEqual(status["action"]["status"], "delivered")
+                    self.assertIsNone(self.poll()["action"])
+                    self.clock.now += 5
+                    self.poll()
+                    self.clock.now += 5
+                    status = self.store.status(self.room, action_id)
                 self.assertEqual(status["action"]["status"], "expired")
                 self.assertEqual(self.action(action_id)["action"]["status"], "expired")
                 self.assertIsNone(self.poll()["action"])
                 self.assert_error("action_already_finished", self.store.ack,
                                   self.room, self.session, self.token, action_id, "executed")
+
+    def test_delivered_late_receipt_does_not_extend_dispatch_or_lease(self):
+        self.register()
+        action_id = self.action()["action"]["action_id"]
+        self.poll()
+        self.clock.now += 5.1
+        result = self.store.ack(self.room, self.session, self.token, action_id, "executed")
+        self.assertEqual(result["action"]["status"], "executed")
+        self.assertIsNone(self.poll()["action"])
+        self.clock.now += 6
+        self.assertFalse(self.store.status(self.room)["ready"])
+
+    def test_reconnect_retains_old_receipt_without_authorizing_old_session(self):
+        self.register()
+        old_session, old_token = self.session, self.token
+        old_id = self.action()["action"]["action_id"]
+        self.poll()
+        self.store.unregister(self.room, old_session, old_token)
+        self.register()
+        current_id = self.action()["action"]["action_id"]
+        self.assert_error("session_mismatch", self.store.poll, self.room, old_session, old_token)
+        self.assert_error("session_mismatch", self.store.action, self.room, old_session, str(uuid4()))
+        self.assert_error("action_id_conflict", self.action, old_id)
+        self.assert_error("receiver_token_invalid", self.store.ack, self.room, old_session,
+                          "x" * 43, old_id, "executed")
+        self.store.ack(self.room, old_session, old_token, old_id, "executed")
+        self.assertEqual(self.store.status(self.room, old_id)["action"]["status"], "executed")
+        self.assertEqual(self.store.status(self.room)["action"]["action_id"], current_id)
+        self.assertEqual(self.poll()["action"]["action_id"], current_id)
+        self.assert_error("action_already_finished", self.store.ack,
+                          self.room, old_session, old_token, old_id, "cancelled", "paste_unconfirmed")
+        self.assertIsNone(self.store.status("other", old_id)["action"])
+
+    def test_closed_session_receipt_window_expires_and_history_is_bounded(self):
+        self.store = SignalStore(clock=self.clock, poll_seconds=0, max_previous_sessions=1)
+        self.register()
+        old_session, old_token = self.session, self.token
+        old_id = self.action()["action"]["action_id"]
+        self.poll()
+        self.store.unregister(self.room, self.session, self.token)
+        self.register()
+        self.store.unregister(self.room, self.session, self.token)
+        self.assert_error("signal_capacity_reached", self.register)
+        self.assertEqual(self.store.status(self.room, old_id)["action"]["status"], "delivered")
+        self.clock.now += 15
+        self.assert_error("action_already_finished", self.store.ack,
+                          self.room, old_session, old_token, old_id, "executed")
+        self.register()
+        self.assertLessEqual(len(self.store.previous[self.room]), 1)
+        self.clock.now += 120
+        self.assertIsNone(self.store.status(self.room, old_id)["action"])
 
     def test_cancelled_action_stays_cancelled_and_pending_cannot_ack(self):
         self.register()
@@ -178,6 +236,18 @@ class SignalStoreTests(unittest.TestCase):
         self.clock.now += 6
         self.store.register("third")
         self.assertEqual(len(self.store.rooms), 2)
+
+    def test_room_capacity_cannot_evict_an_inflight_receipt(self):
+        self.store = SignalStore(clock=self.clock, poll_seconds=0, max_rooms=1)
+        self.register()
+        action_id = self.action()["action"]["action_id"]
+        self.poll()
+        self.store.unregister(self.room, self.session, self.token)
+        self.assert_error("signal_capacity_reached", self.store.register, "new-room")
+        self.assertEqual(self.store.status(self.room, action_id)["action"]["status"], "delivered")
+        self.store.ack(self.room, self.session, self.token, action_id, "executed")
+        self.store.register("new-room")
+        self.assertEqual(len(self.store.rooms), 1)
 
     def test_one_long_poll_at_a_time_and_unregister_wakes_it(self):
         self.store = SignalStore(poll_seconds=1)

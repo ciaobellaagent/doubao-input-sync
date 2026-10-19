@@ -103,6 +103,25 @@ class ProgressTests(unittest.TestCase):
 
 
 class ControlDiagnosticTests(unittest.TestCase):
+    def test_receipt_transport_retry_never_repeats_action(self):
+        api = Mock()
+        receipt = {"action_id": str(uuid4()), "status": "executed"}
+        api.request.side_effect = [receiver.ApiError("transport_failed"), {"ok": True}]
+        receiver.acknowledge_result(api, receipt)
+        self.assertEqual(api.request.call_args_list, [unittest.mock.call("ack", receipt)] * 2)
+
+    def test_ack_conflict_is_not_a_connection_failure_and_other_errors_stay_errors(self):
+        api = Mock()
+        api.request.side_effect = receiver.ControlApiError(409, "action_already_finished")
+        receiver.acknowledge_result(api, {})
+        api.request.assert_called_once_with("ack", {})
+        api.request.side_effect = receiver.ControlApiError(403, "receiver_token_invalid")
+        with self.assertRaises(receiver.ControlApiError):
+            receiver.acknowledge_result(api, {})
+
+    def test_unconfirmed_native_receipt_is_preserved_without_success(self):
+        self.assertEqual(receiver.native_result("paste_unconfirmed", 0), "paste_unconfirmed")
+
     def test_ack_conflict_and_transport_failure_are_separate_and_redacted(self):
         api = receiver.ControlApi("http://127.0.0.1")
         responses = [
@@ -137,8 +156,8 @@ class ControlDiagnosticTests(unittest.TestCase):
             self.assertEqual(trace.call_args.kwargs["outcome"], "process_timeout")
             self.assertNotIn("private", repr(trace.call_args))
 
-    def test_server_expired_ack_conflict_reproduces_without_paste(self):
-        from app.signal_trial import SignalStore, SignalError
+    def test_server_late_ack_is_a_receipt_only_without_paste(self):
+        from app.signal_trial import SignalStore
         now = [100.0]
         store = SignalStore(clock=lambda: now[0], poll_seconds=0)
         registration = store.register("synthetic")
@@ -147,10 +166,9 @@ class ControlDiagnosticTests(unittest.TestCase):
         store.action("synthetic", session, action_id)
         store.poll("synthetic", session, token)
         now[0] += 5.01
-        with self.assertRaises(SignalError) as error:
-            store.ack("synthetic", session, token, action_id, "cancelled", "expired")
-        self.assertEqual(error.exception.reason, "action_already_finished")
-        self.assertEqual(error.exception.status, 409)
+        result = store.ack("synthetic", session, token, action_id, "cancelled", "paste_unconfirmed")
+        self.assertEqual(result["action"]["reason"], "paste_unconfirmed")
+        self.assertIsNone(store.poll("synthetic", session, token)["action"])
 
 
 @unittest.skipUnless(sys.platform == "darwin", "Native logger requires macOS Swift")

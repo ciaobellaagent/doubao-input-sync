@@ -243,6 +243,18 @@ test('editing text or entering background cancels only the unsent attachment int
   assert.equal(callsTo(hidden, '/action').length, 0);
 });
 
+test('the existing clear button cancels an unsent attachment even though it does not emit an input event', async () => {
+  const env = await uploaded({ ready: false });
+  env.click('attachment-paste-button'); await settle();
+  assert.equal(env.bridge.busy, true);
+  env.click('clear-button');
+  assert.equal(env.bridge.busy, false);
+  assert.match(env.get('attachment-status').textContent, /输入框已清空，已取消等待中的附件粘贴/);
+  env.server.ready = true; await env.interval(); await env.interval();
+  assert.equal(callsTo(env, '/action').length, 0);
+  assert.equal(env.get('attachment-list').children.length, 1);
+});
+
 test('choosing a new attachment invalidates a queued intent and late action response', async () => {
   const env = await uploaded({ ready: false }); env.click('attachment-paste-button'); await settle();
   env.choose(file('next.png')); env.server.ready = true; await env.interval();

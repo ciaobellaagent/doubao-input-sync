@@ -392,6 +392,8 @@
     });
     uploadButton.addEventListener("click", () => { void upload(); });
     pasteButton.addEventListener("click", beginPaste);
+    const clear = get("clear-button");
+    if (clear) clear.addEventListener("click", () => cancelQueue("输入框已清空，已取消等待中的附件粘贴；附件留档保留。"));
     const editor = get("mobile-editor");
     if (editor) {
       editor.addEventListener("input", () => cancelQueue("文字已修改，已取消等待中的附件粘贴；附件留档保留。"));

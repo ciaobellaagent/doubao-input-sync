@@ -72,6 +72,18 @@ Ordinary apps use system focus and standard Command-V without per-app or website
 
 **WorkBuddy compatibility exception:** WorkBuddy uses its native Edit → Paste menu (`paste:` through accessibility). Other supported apps use simulated Command-V. This is an explicit app-specific route, not proof that keyboard paste cannot work in WorkBuddy. See [Mac receiver details](docs/PREARMED_RECEIVER.md).
 
+## Images and files (trial)
+
+Expand **Images and files** on the existing phone page. Select one photo or file (or paste/drop a file exposed by the browser), then choose **Upload and archive**. The bytes travel through the relay and remain in the room's attachment archive. The desktop page lists the same files with download links. The existing text routes are unchanged.
+
+After upload, **Paste attachment to computer** can wait up to 15 seconds for preparation. The Mac downloads and checks the file in a private cache without touching the clipboard. Only a separate, short-lived, one-shot action writes a Finder-style file URL and, for supported images, a PNG representation to the Mac clipboard and invokes paste. Files are never opened or executed by the receiver. No Enter key is sent.
+
+The destination must accept image/file paste; plain text inputs cannot accept a file. An attachment execution receipt confirms **command dispatch only**, not that the destination accepted an attachment. Failed/unknown results keep the archive and never automatically retry paste. Browser access to arbitrary clipboard files varies, so the file/photo picker is the reliable entry point. Windows attachment automation is not included in this trial; download links remain usable.
+
+Limits: one file at a time, 20 MiB per file, 512 MiB and 512 files across the server archive. Deletion is explicit. Uploading, selecting history, or reconnecting never authorizes a paste. Images beyond the native conversion limits or unsupported formats remain ordinary files. The Mac cache has a 512 MiB admission budget and can additionally hold one converted PNG up to 50 MiB; a full cache rejects preparation. Server-side deletion does not remove Mac cache files, existing clipboard contents or downloaded copies.
+
+Upgrade both server and Mac receiver, and rebuild the native helper, before using this flow. The same receiver owns text and attachment paste through a shared lock. See [attachment operations](docs/ATTACHMENTS.md).
+
 ## Other desktop options
 
 The Mac receiver above also handles relay sends. Do not run a second paste helper alongside it. Legacy Mac relay helpers and Windows clipboard/paste helpers remain available; Windows does not implement the prepared Mac clipboard-match flow. Start with clipboard-only delivery and validate each target application. See [Windows helper](docs/WINDOWS_HELPER_PLAN.md) and [Operations](docs/OPERATIONS.md).
@@ -90,7 +102,7 @@ See [clipboard and archive behavior](docs/CLIPBOARD_ARCHIVE.md) for clearing, re
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
-node --test tests/test_client_clipboard.js tests/test_signal_trial_client.js
+node --test tests/test_client_clipboard.js tests/test_signal_trial_client.js tests/test_attachments_client.js
 node --check app/static/client.js
 ```
 

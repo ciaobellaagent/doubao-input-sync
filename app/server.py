@@ -24,8 +24,10 @@ from uuid import UUID, uuid4
 
 try:
     from .signal_trial import handle_get as handle_signal_get, handle_post as handle_signal_post
+    from .attachments import handle_get as handle_attachment_get, handle_post as handle_attachment_post
 except ImportError:  # Direct entrypoint: python app/server.py.
     from signal_trial import handle_get as handle_signal_get, handle_post as handle_signal_post
+    from attachments import handle_get as handle_attachment_get, handle_post as handle_attachment_post
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -792,6 +794,9 @@ class RelayHandler(BaseHTTPRequestHandler):
         if handle_signal_get(self, path, parsed.query, STATIC_ROOT):
             return
 
+        if handle_attachment_get(self, path, parsed.query):
+            return
+
         if path == "/api/ping":
             self._send_json({"ok": True, "ts": utc_now_iso()})
             return
@@ -844,10 +849,26 @@ class RelayHandler(BaseHTTPRequestHandler):
             self._serve_file(STATIC_ROOT / "styles.css", "text/css; charset=utf-8")
             return
 
+        if path == "/assets/attachments.js":
+            self._serve_file(STATIC_ROOT / "attachments.js", "application/javascript; charset=utf-8")
+            return
+
+        if path == "/assets/attachments.css":
+            self._serve_file(STATIC_ROOT / "attachments.css", "text/css; charset=utf-8")
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND, "Not found")
 
     def do_POST(self) -> None:
-        if not self._request_allowed() or not self._post_headers_allowed():
+        if not self._request_allowed():
+            return
+        parsed = urlparse(self.path)
+        # Binary uploads validate their own bounded streaming framing. All other
+        # operations retain the existing JSON framing and origin requirements.
+        if self._strip_base_path(parsed.path) == "/api/attachments/upload":
+            handle_attachment_post(self, "/api/attachments/upload", parsed.query)
+            return
+        if not self._post_headers_allowed():
             return
         self.connection.settimeout(10.0)
         try:
@@ -867,6 +888,9 @@ class RelayHandler(BaseHTTPRequestHandler):
             return
 
         if handle_signal_post(self, path):
+            return
+
+        if handle_attachment_post(self, path, parsed.query):
             return
 
         if path == "/api/settings":

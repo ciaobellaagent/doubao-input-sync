@@ -31,6 +31,7 @@
     draftRevision: 0,
     localDraftRestored: false,
     copyPending: false,
+    attachmentBusy: false,
     currentCopyId: null,
     copyOutbox: [],
     copyHistory: [],
@@ -319,8 +320,21 @@
   }
 
   function clipboardBusy() {
-    return state.copyPending || state.signalActionPending || Boolean(state.signalQueuedPaste);
+    return state.attachmentBusy || state.copyPending || state.signalActionPending || Boolean(state.signalQueuedPaste);
   }
+
+  // The optional attachment UI shares clipboard ownership with the text UI.
+  // Preparation/upload is passive; only a pending explicit paste takes a turn.
+  window.doubaoAttachmentBridge = {
+    isTextBusy: function () {
+      return state.copyPending || state.signalActionPending || Boolean(state.signalQueuedPaste) ||
+        state.modeChangePending || state.manualSendPending || state.claimConflict;
+    },
+    setBusy: function (value) {
+      state.attachmentBusy = value === true;
+      updateManualSendAvailability();
+    },
+  };
 
   const matchProtocol = "clipboard-match-v1";
 

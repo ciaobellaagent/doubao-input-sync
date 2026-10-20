@@ -24,6 +24,7 @@ from urllib.parse import urlencode
 from mac_signal_trial import Api, ApiError, REASONS, emit, exclusive_trial, uuid_string
 import mac_paste_helper as relay
 from paste_diagnostics import action_context, current_action_id, trace, STAGES, enable as enable_diagnostics
+from attachment_receiver import AttachmentActor
 
 HERE = Path(__file__).resolve().parent
 PROTOCOL = "clipboard-match-v1"
@@ -439,6 +440,7 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
             identity = None
             watcher = None
             executor = None
+            attachment_actor = None
             session_lost = threading.Event()
             try:
                 registration = api.request("register", {"room_id": room, "protocol": PROTOCOL})
@@ -446,6 +448,8 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                 if not uuid_string(session_id) or not isinstance(token, str) or not token or registration.get("protocol") != PROTOCOL:
                     raise ApiError("invalid_registration")
                 identity = {"room_id": room, "session_id": session_id, "receiver_token": token}
+                attachment_actor = AttachmentActor(api.base, identity, action_lock,
+                    lambda: stopped() or session_lost.is_set()).start()
                 watcher = PassiveWatcher()
                 consumer = MatchConsumer(session_id, watcher, lambda deadline, sha: paste_matching(deadline, sha, lambda: stopped() or session_lost.is_set()), action_lock)
                 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="authorized-action")
@@ -473,7 +477,7 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                     # Reaching the cap starts rotation only AFTER the final
                     # authorized action and its ACK finish. Keep polling while
                     # that job runs so its lease remains valid.
-                    if len(submitted) >= MAX_ACTIONS_PER_SESSION and job is None:
+                    if (len(submitted) >= MAX_ACTIONS_PER_SESSION or attachment_actor.exhausted) and job is None:
                         break
                     started = time.monotonic()
                     response = api.request("poll", identity)
@@ -540,6 +544,8 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                 emit("disconnected")
             finally:
                 session_lost.set()
+                if attachment_actor:
+                    attachment_actor.close()
                 if executor:
                     executor.shutdown(wait=True)
                 if watcher:

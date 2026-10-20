@@ -13,11 +13,12 @@ jobs:
       - name: Python regression tests
         run: python3 -m unittest discover -s tests
       - name: Browser logic tests
-        run: node --test tests/test_client_clipboard.js tests/test_signal_trial_client.js
+        run: node --test tests/test_client_clipboard.js tests/test_signal_trial_client.js tests/test_attachments_client.js
       - name: JavaScript syntax
         run: |
           node --check app/static/client.js
           node --check app/static/signal-trial.js
+          node --check app/static/attachments.js
       - name: Public tree and history hygiene
         run: python3 scripts/check_public_release.py --history
       - name: Native pure checks (no desktop events)

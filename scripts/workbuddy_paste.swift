@@ -3,6 +3,7 @@ import ApplicationServices
 import CryptoKit
 import Foundation
 import Darwin
+import ImageIO
 
 // WorkBuddy's focused AX element can be visible to the native API but cannot
 // be represented by System Events. Field text is read only in memory to verify
@@ -560,6 +561,490 @@ func run(deadline: Double, expectedHash: String, owner: pid_t, expectedPid: pid_
     }
 }
 
+// Attachment files have one private, bounded cache location. Validation and
+// image preparation below never query accessibility or touch the pasteboard.
+let attachmentOriginalLimit = 20 * 1024 * 1024
+let attachmentPNGLimit = 50 * 1024 * 1024
+let attachmentPixelLimit = 25_000_000
+let attachmentDimensionLimit = 16_384
+let attachmentCacheRoot = URL(fileURLWithPath: NSHomeDirectory())
+    .appendingPathComponent("Library/Application Support/DoubaoInputSync/attachments").path
+struct AttachmentFailure: Error { let result: String }
+final class AttachmentDirectory {
+    let fd: Int32
+    let path: String
+    init(fd: Int32, path: String) { self.fd = fd; self.path = path }
+    deinit { close(fd) }
+}
+struct AttachmentFile {
+    let directory: AttachmentDirectory
+    let basename: String
+    let metadata: stat
+    let data: Data
+    var path: String { directory.path + "/" + basename }
+}
+func dataDigest(_ data: Data) -> String {
+    SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+func safeAttachmentBasename(_ name: String) -> Bool {
+    !name.isEmpty && !name.hasPrefix(".") && name.utf8.count <= 240 &&
+        !name.contains("/") && !name.contains("\\") &&
+        name.trimmingCharacters(in: .whitespacesAndNewlines) == name &&
+        !name.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+}
+func canonicalAttachmentUUID(_ name: String) -> Bool {
+    UUID(uuidString: name)?.uuidString.lowercased() == name
+}
+// Walk every component with O_NOFOLLOW. Resolving a symlink and then testing
+// its destination would allow an out-of-cache file to enter the clipboard.
+func openAttachmentDirectory(_ path: String, privateDirectory: Bool) throws -> Int32 {
+    guard path.hasPrefix("/"), URL(fileURLWithPath: path).standardizedFileURL.path == path else {
+        throw AttachmentFailure(result: "attachment_cache_unsafe")
+    }
+    var current = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard current >= 0 else { throw AttachmentFailure(result: "attachment_cache_unsafe") }
+    do {
+        for part in path.split(separator: "/") {
+            let next = openat(current, String(part), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard next >= 0 else { throw AttachmentFailure(result: "attachment_cache_unsafe") }
+            close(current)
+            current = next
+        }
+        var metadata = stat()
+        guard fstat(current, &metadata) == 0,
+              (metadata.st_mode & S_IFMT) == S_IFDIR,
+              !privateDirectory || (metadata.st_uid == getuid() && metadata.st_mode & 0o7077 == 0) else {
+            throw AttachmentFailure(result: "attachment_cache_unsafe")
+        }
+        return current
+    } catch { close(current); throw error }
+}
+func attachmentDirectory(originalPath: String, cacheRoot: String) throws -> (AttachmentDirectory, String) {
+    guard cacheRoot.hasPrefix("/"), !cacheRoot.hasSuffix("/"),
+          URL(fileURLWithPath: cacheRoot).standardizedFileURL.path == cacheRoot,
+          originalPath.hasPrefix(cacheRoot + "/"),
+          URL(fileURLWithPath: originalPath).standardizedFileURL.path == originalPath else {
+        throw AttachmentFailure(result: "attachment_cache_unsafe")
+    }
+    let parts = String(originalPath.dropFirst(cacheRoot.count + 1)).split(separator: "/", omittingEmptySubsequences: false)
+    guard parts.count == 2, canonicalAttachmentUUID(String(parts[0])), safeAttachmentBasename(String(parts[1])) else {
+        throw AttachmentFailure(result: "attachment_cache_unsafe")
+    }
+    let rootFD = try openAttachmentDirectory(cacheRoot, privateDirectory: true)
+    defer { close(rootFD) }
+    let directoryPath = cacheRoot + "/" + parts[0]
+    let fd = openat(rootFD, String(parts[0]), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard fd >= 0 else { throw AttachmentFailure(result: "attachment_cache_unsafe") }
+    var metadata = stat()
+    guard fstat(fd, &metadata) == 0, (metadata.st_mode & S_IFMT) == S_IFDIR,
+          metadata.st_uid == getuid(), metadata.st_mode & 0o7077 == 0 else {
+        close(fd); throw AttachmentFailure(result: "attachment_cache_unsafe")
+    }
+    return (AttachmentDirectory(fd: fd, path: directoryPath), String(parts[1]))
+}
+func readAttachmentFile(directory: AttachmentDirectory, basename: String, limit: Int) throws -> AttachmentFile {
+    let fd = openat(directory.fd, basename, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else { throw AttachmentFailure(result: "attachment_cache_unsafe") }
+    defer { close(fd) }
+    var metadata = stat()
+    guard fstat(fd, &metadata) == 0, (metadata.st_mode & S_IFMT) == S_IFREG,
+          metadata.st_uid == getuid(), metadata.st_nlink == 1,
+          metadata.st_mode & 0o7177 == 0, metadata.st_size >= 0 else {
+        throw AttachmentFailure(result: "attachment_cache_unsafe")
+    }
+    guard metadata.st_size <= limit else { throw AttachmentFailure(result: "attachment_too_large") }
+    var data = Data()
+    var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+    while true {
+        let count = read(fd, &buffer, min(buffer.count, limit - data.count + 1))
+        if count == 0 { break }
+        if count < 0 {
+            if errno == EINTR { continue }
+            throw AttachmentFailure(result: "attachment_read_failed")
+        }
+        guard data.count + count <= limit else { throw AttachmentFailure(result: "attachment_too_large") }
+        data.append(contentsOf: buffer.prefix(count))
+    }
+    var after = stat()
+    guard fstat(fd, &after) == 0, after.st_dev == metadata.st_dev, after.st_ino == metadata.st_ino,
+          after.st_size == metadata.st_size, data.count == metadata.st_size,
+          after.st_mtimespec.tv_sec == metadata.st_mtimespec.tv_sec,
+          after.st_mtimespec.tv_nsec == metadata.st_mtimespec.tv_nsec,
+          after.st_ctimespec.tv_sec == metadata.st_ctimespec.tv_sec,
+          after.st_ctimespec.tv_nsec == metadata.st_ctimespec.tv_nsec else {
+        throw AttachmentFailure(result: "attachment_changed")
+    }
+    return AttachmentFile(directory: directory, basename: basename, metadata: metadata, data: data)
+}
+func attachmentStillCurrent(_ file: AttachmentFile) -> Bool {
+    var metadata = stat()
+    // The URL will later be consumed by the target app. Reject replaced cache
+    // directories too, not just a changed file under an already-open dirfd.
+    guard let liveFD = try? openAttachmentDirectory(file.directory.path, privateDirectory: true) else { return false }
+    defer { close(liveFD) }
+    var openedDirectory = stat(), liveDirectory = stat()
+    guard fstat(file.directory.fd, &openedDirectory) == 0, fstat(liveFD, &liveDirectory) == 0,
+          openedDirectory.st_dev == liveDirectory.st_dev, openedDirectory.st_ino == liveDirectory.st_ino else { return false }
+    return fstatat(liveFD, file.basename, &metadata, AT_SYMLINK_NOFOLLOW) == 0 &&
+        (metadata.st_mode & S_IFMT) == S_IFREG && metadata.st_nlink == 1 &&
+        metadata.st_uid == getuid() && metadata.st_mode & 0o7177 == 0 &&
+        metadata.st_dev == file.metadata.st_dev && metadata.st_ino == file.metadata.st_ino &&
+        metadata.st_size == file.metadata.st_size &&
+        metadata.st_mtimespec.tv_sec == file.metadata.st_mtimespec.tv_sec &&
+        metadata.st_mtimespec.tv_nsec == file.metadata.st_mtimespec.tv_nsec &&
+        metadata.st_ctimespec.tv_sec == file.metadata.st_ctimespec.tv_sec &&
+        metadata.st_ctimespec.tv_nsec == file.metadata.st_ctimespec.tv_nsec
+}
+func attachmentDimensionsAllowed(width: Int64, height: Int64) -> Bool {
+    width > 0 && height > 0 && width <= attachmentDimensionLimit && height <= attachmentDimensionLimit &&
+        width <= Int64(attachmentPixelLimit) / height
+}
+func boundedImageSource(_ data: Data, pngOnly: Bool = false) -> (source: CGImageSource, width: Int64, height: Int64)? {
+    guard let source = CGImageSourceCreateWithData(data as CFData,
+            [kCGImageSourceShouldCache: false] as CFDictionary), CGImageSourceGetCount(source) > 0,
+          !pngOnly || CGImageSourceGetType(source) as String? == "public.png",
+          let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+          let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+          let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else { return nil }
+    let w = width.int64Value, h = height.int64Value
+    // Metadata must pass before any pixel decoding. Unknown/oversized/broken
+    // images remain ordinary files and are never decoded as a fallback.
+    guard attachmentDimensionsAllowed(width: w, height: h) else { return nil }
+    return (source, w, h)
+}
+func boundedPNG(_ data: Data) -> Data? {
+    guard let input = boundedImageSource(data),
+          let image = CGImageSourceCreateThumbnailAtIndex(input.source, 0,
+            [kCGImageSourceCreateThumbnailFromImageAlways: true,
+             kCGImageSourceCreateThumbnailWithTransform: true,
+             kCGImageSourceThumbnailMaxPixelSize: max(input.width, input.height),
+             kCGImageSourceShouldCacheImmediately: true] as CFDictionary),
+          attachmentDimensionsAllowed(width: Int64(image.width), height: Int64(image.height)) else { return nil }
+    let output = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(output, "public.png" as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination), output.length <= attachmentPNGLimit else { return nil }
+    return output as Data
+}
+func prepareAttachment(originalPath: String, pngPath: String, cacheRoot: String = attachmentCacheRoot) -> String {
+    do {
+        let (directory, basename) = try attachmentDirectory(originalPath: originalPath, cacheRoot: cacheRoot)
+        guard pngPath == directory.path + "/.clipboard.png" else { return "attachment_cache_unsafe" }
+        let original = try readAttachmentFile(directory: directory, basename: basename, limit: attachmentOriginalLimit)
+        guard let png = boundedPNG(original.data) else { return "file_ready" }
+        guard attachmentStillCurrent(original) else { return "attachment_changed" }
+        let fd = openat(directory.fd, ".clipboard.png", O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        if fd < 0 {
+            guard errno == EEXIST else { return "attachment_cache_unsafe" }
+            // A new preparation may reuse this attachment's cache directory.
+            // Reuse only an intact private output derived from this exact
+            // original, never an unchecked filename or an in-place overwrite.
+            let existing = try readAttachmentFile(directory: directory, basename: ".clipboard.png", limit: attachmentPNGLimit)
+            guard existing.data == png else { return "attachment_cache_unsafe" }
+            guard attachmentStillCurrent(original), attachmentStillCurrent(existing) else { return "attachment_changed" }
+            return "image_ready"
+        }
+        var completed = false
+        defer {
+            close(fd)
+            if !completed { _ = unlinkat(directory.fd, ".clipboard.png", 0) }
+        }
+        try png.withUnsafeBytes { raw in
+            var written = 0
+            while written < png.count {
+                let count = write(fd, raw.baseAddress!.advanced(by: written), png.count - written)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw AttachmentFailure(result: "attachment_write_failed") }
+                written += count
+            }
+        }
+        guard attachmentStillCurrent(original) else { return "attachment_changed" }
+        completed = true
+        return "image_ready"
+    } catch let error as AttachmentFailure { return error.result }
+    catch { return "attachment_prepare_failed" }
+}
+func attachmentClipboardMatches(_ clipboard: NSPasteboard, count: Int, fileURL: String, png: Data?) -> Bool {
+    guard clipboard.changeCount == count, let items = clipboard.pasteboardItems, items.count == 1,
+          items[0].string(forType: .fileURL) == fileURL else { return false }
+    if let png = png {
+        guard items[0].data(forType: .png) == png else { return false }
+    } else if items[0].types.contains(.png) { return false }
+    return clipboard.changeCount == count
+}
+// No callback is retried. A stopped guard cannot progress to a clipboard write
+// or dispatch; a successful dispatch is never converted into insertion proof.
+func guardedAttachmentDispatch(beforeWrite: () throws -> Void, writeClipboard: () throws -> Void,
+                               beforeDispatch: () throws -> Void, dispatch: () throws -> Bool) throws -> String {
+    try beforeWrite()
+    try writeClipboard()
+    try beforeDispatch()
+    return try dispatch() ? "paste_dispatched" : "paste_failed"
+}
+func runAttachment(deadline: Double, originalPath: String, expectedHash: String, pngPath: String?,
+                   owner: pid_t, expectedPid: pid_t) -> String {
+    func expired() -> Bool { Date().timeIntervalSince1970 * 1000 >= deadline }
+    func ownerGone() -> Bool { kill(owner, 0) != 0 }
+    guard !expired(), !ownerGone() else { return "expired" }
+    guard expectedPid > 1 else { return "no_focused_input" }
+    guard AXIsProcessTrusted() else { note("ax_trust", -25211); return "permission_missing" }
+    let isWorkBuddy = NSRunningApplication(processIdentifier: expectedPid)?.bundleIdentifier == "com.tencent.workbuddy.mac"
+    if !isWorkBuddy && !CGPreflightPostEventAccess() { note("key_trust", -25211); return "permission_missing" }
+    let clipboard = NSPasteboard.general
+    let initialClipboardCount = clipboard.changeCount
+    let system = AXUIElementCreateSystemWide()
+    AXUIElementSetMessagingTimeout(system, 0.25)
+    do {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { return "focus_changed" }
+        let app = AXUIElementCreateApplication(expectedPid)
+        AXUIElementSetMessagingTimeout(app, 0.25)
+        if ["com.tencent.workbuddy.mac", "com.google.antigravity-ide"].contains(NSRunningApplication(processIdentifier: expectedPid)?.bundleIdentifier ?? "") {
+            _ = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        }
+        var initialWindow: AXUIElement?
+        let initial = try captureInitialFocus(check: {
+            guard !expired() else { throw ActionStopped(result: "expired") }
+            guard !ownerGone() else { throw ActionStopped(result: "receiver_stopped") }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else { throw FocusChanged() }
+        }, prepare: {
+            let role = try attribute(app, kAXRoleAttribute, "ax_app_role")
+            guard let role = role as? String, role == kAXApplicationRole else {
+                throw AXFailure(stage: "ax_app_role_type", code: .illegalArgument)
+            }
+        }, read: {
+            try focus(system, expectedPid, observeWindow: { window in
+                if let captured = initialWindow, !CFEqual(captured, window) { throw FocusChanged() }
+                initialWindow = window
+            })
+        }, onRetry: { failure in recordFocusFailure(failure); note("ax_focus_read_retry", 0) })
+        if let result = try roleCheck(initial.field) { return result }
+        if modifiersHeld(.initial) { return "modifier_held" }
+        let before = try inputSnapshot(initial.field)
+        // Anchor the field and selection before bounded file I/O. A same-app
+        // input/window change during hashing must fail the final focus guard.
+        let (directory, basename) = try attachmentDirectory(originalPath: originalPath, cacheRoot: attachmentCacheRoot)
+        let original = try readAttachmentFile(directory: directory, basename: basename, limit: attachmentOriginalLimit)
+        guard dataDigest(original.data) == expectedHash else { return "attachment_hash_mismatch" }
+        var pngFile: AttachmentFile?
+        if let pngPath = pngPath {
+            guard pngPath == directory.path + "/.clipboard.png" else { return "attachment_cache_unsafe" }
+            pngFile = try readAttachmentFile(directory: directory, basename: ".clipboard.png", limit: attachmentPNGLimit)
+            guard let data = pngFile?.data, boundedImageSource(data, pngOnly: true) != nil else {
+                return "attachment_prepare_failed"
+            }
+        }
+        let menuItem = isWorkBuddy ? try pasteMenuItem(initial.app) : nil
+        let source = isWorkBuddy ? nil : CGEventSource(stateID: .combinedSessionState)
+        let keyEvents = source.flatMap(pasteKeyEvents)
+        guard isWorkBuddy || keyEvents != nil else { return "paste_failed" }
+        let fileURL = URL(fileURLWithPath: original.path).absoluteString
+        let item = NSPasteboardItem()
+        guard item.setString(fileURL, forType: .fileURL) else { return "paste_failed" }
+        if let png = pngFile?.data, !item.setData(png, forType: .png) { return "paste_failed" }
+        var count = initialClipboardCount
+        return try guardedAttachmentDispatch(beforeWrite: {
+            guard sameFocus(initial, try focus(system, expectedPid)), sameSnapshot(before, try inputSnapshot(initial.field)) else {
+                throw ActionStopped(result: "focus_changed")
+            }
+            if let result = try roleCheck(initial.field) { throw ActionStopped(result: result) }
+            if modifiersHeld(.clipboardReady) { throw ActionStopped(result: "modifier_held") }
+            guard !expired(), !ownerGone() else { throw ActionStopped(result: "expired") }
+            guard attachmentStillCurrent(original), pngFile.map(attachmentStillCurrent) ?? true else {
+                throw AttachmentFailure(result: "attachment_changed")
+            }
+            guard clipboard.changeCount == initialClipboardCount else { throw ActionStopped(result: "clipboard_changed") }
+        }, writeClipboard: {
+            // One item advertises the original file URL and optional PNG pixels.
+            // Never restore over a user's later clipboard contents on failure.
+            let clearedCount = clipboard.clearContents()
+            guard clipboard.changeCount == clearedCount else { throw ActionStopped(result: "clipboard_changed") }
+            guard clipboard.writeObjects([item]) else { throw ActionStopped(result: "paste_failed") }
+            count = clipboard.changeCount
+        }, beforeDispatch: {
+            guard attachmentClipboardMatches(clipboard, count: count, fileURL: fileURL, png: pngFile?.data) else {
+                throw ActionStopped(result: "clipboard_changed")
+            }
+            guard sameFocus(initial, try focus(system, expectedPid)), sameSnapshot(before, try inputSnapshot(initial.field)) else {
+                throw ActionStopped(result: "focus_changed")
+            }
+            if let result = try roleCheck(initial.field) { throw ActionStopped(result: result) }
+            if modifiersHeld(.preDispatch) { throw ActionStopped(result: "modifier_held") }
+            guard !expired(), !ownerGone() else { throw ActionStopped(result: "expired") }
+            guard attachmentStillCurrent(original), pngFile.map(attachmentStillCurrent) ?? true else {
+                throw AttachmentFailure(result: "attachment_changed")
+            }
+            guard attachmentClipboardMatches(clipboard, count: count, fileURL: fileURL, png: pngFile?.data) else {
+                throw ActionStopped(result: "clipboard_changed")
+            }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else {
+                throw ActionStopped(result: "focus_changed")
+            }
+            guard !expired(), !ownerGone() else { throw ActionStopped(result: "expired") }
+        }, dispatch: {
+            note("attachment_dispatch_intent", 0)
+            if let item = menuItem {
+                let error = AXUIElementPerformAction(item, kAXPressAction as CFString)
+                note("menu_paste_dispatch", error.rawValue)
+                return error == .success
+            }
+            guard let events = keyEvents else { return false }
+            for event in events { event.post(tap: .cghidEventTap) }
+            note("key_paste_dispatch", 0)
+            // AX field text cannot confirm attachment acceptance. No retry,
+            // fallback, extra key or Enter is sent after this single command.
+            return true
+        })
+    } catch let error as AttachmentFailure { return error.result }
+    catch let error as ActionStopped { return error.result }
+    catch let error as TargetRejected { return error.result }
+    catch is FocusChanged { return "focus_changed" }
+    catch { recordFocusFailure(error); return "paste_failed" }
+}
+func attachmentPureChecks() {
+    for stop in 0...2 {
+        var steps: [Int] = []
+        func step(_ current: Int) throws {
+            steps.append(current)
+            if current == stop { throw ActionStopped(result: "clipboard_changed") }
+        }
+        do {
+            _ = try guardedAttachmentDispatch(beforeWrite: { try step(0) }, writeClipboard: { try step(1) },
+                beforeDispatch: { try step(2) }, dispatch: { preconditionFailure("a stopped attachment guard must never dispatch") })
+            preconditionFailure("a stopped attachment guard must fail")
+        } catch let error as ActionStopped {
+            precondition(error.result == "clipboard_changed" && steps == Array(0...stop))
+        } catch { preconditionFailure("attachment guard reason must be preserved") }
+    }
+    for didDispatch in [false, true] {
+        var steps: [Int] = []
+        let result = try! guardedAttachmentDispatch(beforeWrite: { steps.append(0) }, writeClipboard: { steps.append(1) },
+            beforeDispatch: { steps.append(2) }, dispatch: { steps.append(3); return didDispatch })
+        precondition(steps == [0, 1, 2, 3])
+        precondition(result == (didDispatch ? "paste_dispatched" : "paste_failed"))
+        precondition(result != "executed")
+    }
+    precondition(safeAttachmentBasename("说明 图片.png"))
+    for name in ["", ".", "..", ".clipboard.png", "../a", "a/b", "a\\b", "x\n", " x", "x ", String(repeating: "x", count: 241)] {
+        precondition(!safeAttachmentBasename(name))
+    }
+    precondition(canonicalAttachmentUUID("e40d4fb3-a855-44ba-98d8-b9919947969f"))
+    precondition(!canonicalAttachmentUUID("E40D4FB3-A855-44BA-98D8-B9919947969F"))
+    precondition(attachmentDimensionsAllowed(width: 5000, height: 5000))
+    for dimensions: (Int64, Int64) in [(0, 1), (1, 0), (-1, 1), (5001, 5000), (1, 16385), (Int64.max, Int64.max)] {
+        precondition(!attachmentDimensionsAllowed(width: dimensions.0, height: dimensions.1))
+    }
+    precondition(boundedPNG(Data("ordinary file".utf8)) == nil)
+    // macOS's default /var temp path itself traverses a system symlink. Use an
+    // isolated, short-lived home-cache fixture to exercise the same strict
+    // no-symlink policy used for the actual attachment cache.
+    let directory = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Caches")
+        .appendingPathComponent("doubao-attachment-pure-" + UUID().uuidString.lowercased())
+    let cache = directory.appendingPathComponent("attachments")
+    do {
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: directory) }
+        func fixtureDirectory() throws -> URL {
+            let folder = cache.appendingPathComponent(UUID().uuidString.lowercased())
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+            return folder
+        }
+        func write(_ data: Data, _ path: URL) throws {
+            try data.write(to: path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+        }
+        let ordinary = try fixtureDirectory()
+        let ordinaryPath = ordinary.appendingPathComponent("plain.txt")
+        try write(Data("plain".utf8), ordinaryPath)
+        let ordinaryResult = prepareAttachment(originalPath: ordinaryPath.path,
+            pngPath: ordinary.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path)
+        precondition(ordinaryResult == "file_ready", ordinaryResult)
+        precondition(!FileManager.default.fileExists(atPath: ordinary.appendingPathComponent(".clipboard.png").path))
+        precondition(prepareAttachment(originalPath: ordinaryPath.path,
+            pngPath: directory.appendingPathComponent("wrong.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        let (opened, basename) = try attachmentDirectory(originalPath: ordinaryPath.path, cacheRoot: cache.path)
+        let unchanged = try readAttachmentFile(directory: opened, basename: basename, limit: attachmentOriginalLimit)
+        precondition(attachmentStillCurrent(unchanged))
+        precondition(dataDigest(unchanged.data) == digest("plain"))
+        try write(Data("changed".utf8), ordinaryPath)
+        precondition(!attachmentStillCurrent(unchanged))
+        // Tiny real PNG data, synthesized entirely in memory; no screen/image
+        // files, app state, clipboard or AX permissions are consulted.
+        let rgba = Data([255, 0, 0, 255])
+        let provider = CGDataProvider(data: rgba as CFData)!
+        let image = CGImage(width: 1, height: 1, bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.last.rawValue),
+            provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
+        let png = NSMutableData()
+        let destination = CGImageDestinationCreateWithData(png, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(destination, image, nil)
+        precondition(CGImageDestinationFinalize(destination))
+        precondition(boundedPNG(png as Data) != nil)
+        precondition(boundedImageSource(png as Data, pngOnly: true) != nil)
+        precondition(boundedImageSource(Data([137, 80, 78, 71, 13, 10, 26, 10]), pngOnly: true) == nil)
+        let picture = try fixtureDirectory()
+        let picturePath = picture.appendingPathComponent("no-extension")
+        try write(png as Data, picturePath)
+        let pngPath = picture.appendingPathComponent(".clipboard.png")
+        precondition(prepareAttachment(originalPath: picturePath.path, pngPath: pngPath.path, cacheRoot: cache.path) == "image_ready")
+        let (pictureDir, _) = try attachmentDirectory(originalPath: picturePath.path, cacheRoot: cache.path)
+        let prepared = try readAttachmentFile(directory: pictureDir, basename: ".clipboard.png", limit: attachmentPNGLimit)
+        precondition(prepared.data.starts(with: [137, 80, 78, 71, 13, 10, 26, 10]))
+        precondition(attachmentStillCurrent(prepared))
+        // Re-preparation is idempotent only for the exact validated output.
+        // A changed output is never trusted, deleted or overwritten.
+        precondition(prepareAttachment(originalPath: picturePath.path, pngPath: pngPath.path, cacheRoot: cache.path) == "image_ready")
+        try write(Data("changed output".utf8), pngPath)
+        precondition(prepareAttachment(originalPath: picturePath.path, pngPath: pngPath.path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        let unchangedBadOutput = try Data(contentsOf: pngPath)
+        precondition(unchangedBadOutput == Data("changed output".utf8))
+        let oversized = try fixtureDirectory()
+        let large = oversized.appendingPathComponent("large.bin")
+        let fd = open(large.path, O_WRONLY | O_CREAT | O_EXCL, 0o600)
+        precondition(fd >= 0 && ftruncate(fd, off_t(attachmentOriginalLimit + 1)) == 0)
+        close(fd)
+        precondition(prepareAttachment(originalPath: large.path,
+            pngPath: oversized.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_too_large")
+        let unsafe = try fixtureDirectory()
+        let link = unsafe.appendingPathComponent("link.txt")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: ordinaryPath)
+        precondition(prepareAttachment(originalPath: link.path,
+            pngPath: unsafe.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        let hardlink = unsafe.appendingPathComponent("hard.txt")
+        precondition(Darwin.link(ordinaryPath.path, hardlink.path) == 0)
+        precondition(prepareAttachment(originalPath: hardlink.path,
+            pngPath: unsafe.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        let linkedDirectory = cache.appendingPathComponent(UUID().uuidString.lowercased())
+        try FileManager.default.createSymbolicLink(at: linkedDirectory, withDestinationURL: ordinary)
+        precondition(prepareAttachment(originalPath: linkedDirectory.appendingPathComponent("plain.txt").path,
+            pngPath: linkedDirectory.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        for invalid in [ordinary.path + "/../plain.txt", cache.path + "-other/plain.txt", directory.appendingPathComponent("outside.txt").path] {
+            precondition(prepareAttachment(originalPath: invalid,
+                pngPath: ordinary.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        }
+        let permissions = try fixtureDirectory()
+        let protectedFile = permissions.appendingPathComponent("private.txt")
+        try write(Data("private".utf8), protectedFile)
+        for mode in [0o644, 0o660, 0o700] {
+            try FileManager.default.setAttributes([.posixPermissions: mode], ofItemAtPath: protectedFile.path)
+            precondition(prepareAttachment(originalPath: protectedFile.path,
+                pngPath: permissions.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: protectedFile.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: permissions.path)
+        precondition(prepareAttachment(originalPath: protectedFile.path,
+            pngPath: permissions.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: permissions.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: cache.path)
+        precondition(prepareAttachment(originalPath: protectedFile.path,
+            pngPath: permissions.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cache.path)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: unsafe.path)
+        precondition(prepareAttachment(originalPath: unsafe.appendingPathComponent("missing.txt").path,
+            pngPath: unsafe.appendingPathComponent(".clipboard.png").path, cacheRoot: cache.path) == "attachment_cache_unsafe")
+    } catch { preconditionFailure("private attachment fixture checks failed") }
+}
+
 if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
     // Pure event-plan checks: never create/post an OS event or query live keys.
     precondition(pasteKeySteps.count == 2)
@@ -883,7 +1368,20 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
         deadline: 200, ownerAlive: { true }, read: { testClock = 201; return "pasted" },
         now: { testClock }, pause: { preconditionFailure("late read must stop") })
     precondition(!lateRead.verified)
-    print("pure guard/hash/focus-retry/insertion checks passed; no AX or clipboard access")
+    attachmentPureChecks()
+    print("pure guard/hash/focus-retry/insertion/attachment checks passed; no AX or clipboard access")
+} else if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--prepare-attachment" {
+    print(prepareAttachment(originalPath: CommandLine.arguments[2], pngPath: CommandLine.arguments[3]))
+} else if CommandLine.arguments.count == 8, CommandLine.arguments[1] == "--paste-attachment",
+          let deadline = Double(CommandLine.arguments[2]), deadline.isFinite,
+          CommandLine.arguments[4].range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+          let owner = Int32(CommandLine.arguments[6]), owner > 1,
+          let requestedPid = Int32(CommandLine.arguments[7]), requestedPid == 0 || requestedPid > 1 {
+    // PID 0 means capture the foreground process once at this explicit command
+    // entry. All subsequent focus checks remain anchored to that exact PID.
+    let target = requestedPid == 0 ? NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0 : requestedPid
+    print(runAttachment(deadline: deadline, originalPath: CommandLine.arguments[3], expectedHash: CommandLine.arguments[4],
+        pngPath: CommandLine.arguments[5] == "-" ? nil : CommandLine.arguments[5], owner: owner, expectedPid: target))
 } else if CommandLine.arguments.count == 5, let deadline = Double(CommandLine.arguments[1]),
           deadline.isFinite, let owner = Int32(CommandLine.arguments[3]), owner > 1,
           let expectedPid = Int32(CommandLine.arguments[4]), expectedPid > 1,

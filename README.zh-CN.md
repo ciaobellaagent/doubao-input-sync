@@ -72,6 +72,14 @@ python3 app/server.py --default-room demo
 
 **WorkBuddy 专项兼容：**WorkBuddy 使用辅助功能接口调用原生“编辑 → 粘贴”菜单（`paste:`）；其他支持的应用使用模拟 Command-V。这是明确保留的应用分支，不代表已证明 WorkBuddy 无法响应所有模拟快捷键。详见 [Mac 接收器](docs/PREARMED_RECEIVER.md)。
 
+## 图片和文件（试用）
+
+在原手机页展开“图片与文件”，选一张图片或一个文件，点“上传并留档”，再点“粘贴附件到电脑”。浏览器能提供剪贴板文件时，也可先把图片／文件粘贴或拖入输入区；普通文字粘贴不受影响。PC 页会显示同一房间的附件留档，可直接下载。
+
+附件本体经过服务器传到 Mac。提前下载、校验和图片转换都不会改剪贴板；只有明确点击后的单次指令才会写入文件／图片剪贴板并调用粘贴。目标应用需要支持附件；回执只确认已调用粘贴，不能证明应用已接受文件。失败、未知或超时不自动重发，附件留档和手机文字都保留。
+
+每次一个附件，单个 20 MiB；服务器总计 512 MiB、最多 512 个附件，不自动删历史。删除服务端留档不会删除电脑缓存、已下载副本或已进入剪贴板的内容。服务器和 Mac 接收器都需更新，并重建原生程序；Windows 本轮仅支持下载。完整边界见 [附件说明](docs/ATTACHMENTS.md)。
+
 ## 其他电脑端方式
 
 上述 Mac 接收器也处理 relay 发送，请勿同时运行第二个粘贴 helper。仓库保留传统 Mac relay helper 和 Windows 复制／粘贴 helper；Windows 尚未实现 Mac 的提前准备与剪贴板匹配流程。先用仅复制模式，再逐个验证目标应用。参见 [Windows helper](docs/WINDOWS_HELPER_PLAN.md) 和 [运行说明](docs/OPERATIONS.md)。
@@ -90,7 +98,7 @@ python3 app/server.py --default-room demo
 
 ```sh
 python3 -m unittest discover -s tests -p 'test_*.py'
-node --test tests/test_client_clipboard.js tests/test_signal_trial_client.js
+node --test tests/test_client_clipboard.js tests/test_signal_trial_client.js tests/test_attachments_client.js
 node --check app/static/client.js
 ```
 

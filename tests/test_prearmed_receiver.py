@@ -255,6 +255,16 @@ class RelayTests(unittest.TestCase):
 
 
 class ReceiveProtocolTests(unittest.TestCase):
+    def setUp(self):
+        # Optional attachment transport has its own isolated network tests.
+        # Signal-protocol fakes must never start an actual background request.
+        self.attachment = Mock()
+        self.attachment.start.return_value = self.attachment
+        self.attachment.exhausted = False
+        patcher = patch.object(receiver, "AttachmentActor", return_value=self.attachment)
+        self.attachment_factory = patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_replaced_preparation_conflict_keeps_real_store_session_without_paste(self):
         from app.signal_trial import SignalError, SignalStore
         store = SignalStore(poll_seconds=0)

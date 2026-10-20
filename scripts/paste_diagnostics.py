@@ -48,6 +48,7 @@ REASONS = frozenset({
     "focus_changed", "no_focused_input", "unsafe_target", "expired", "receiver_stopped",
     "paste_failed", "receiver_expired", "receiver_unregistered", "permission_missing",
     "modifier_held", "superseded", "clipboard_timeout", "clipboard_changed", "mismatch", "paste_unconfirmed",
+    "download_failed", "cache_full", "file_too_large", "preparation_failed",
 })
 ERROR_CODES = frozenset({
     "preparation_mismatch", "session_mismatch", "receiver_token_invalid",
@@ -76,7 +77,7 @@ _ENUM_FIELDS = {
     "reason": REASONS,
     "status": frozenset({"executed", "cancelled"}),
     "stage": STAGES,
-    "route": frozenset({"system_events", "native"}),
+    "route": frozenset({"system_events", "native", "attachment"}),
     "termination": frozenset({"exit", "deadline", "stop", "spawn_error"}),
     "error_code": ERROR_CODES,
 }

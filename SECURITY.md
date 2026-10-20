@@ -13,6 +13,7 @@ Configure `--public-origin` for the exact browser-facing origin. Host and cross-
 ## Data and credentials
 
 - Copy archives contain exact user text and remain on disk until explicitly removed. Relay drafts/history are in memory; browser drafts, retry records and recovery text persist locally.
+- Attachment archives and Mac caches contain complete files and filenames. Uploads do not authorize desktop paste; only a fresh, short-lived action may stage a cached file and dispatch paste. Downloads are attachment responses, and the receiver never opens or executes a transferred file. Native image conversion is bounded by file size, pixel dimensions and output size. Destination applications retain their own file-handling behavior.
 - New archive files are created with restrictive permissions (0600 on POSIX systems), but existing database and directory permissions are not retroactively changed. Check them when upgrading or restoring a backup.
 - These stores are not encrypted by the application. Use OS account isolation, restricted file permissions, disk encryption and protected backups as appropriate for the text you handle.
 - SHA-256 clipboard fingerprints reveal equality and may allow guesses of short or predictable text. Treat them as sensitive metadata, not encryption.

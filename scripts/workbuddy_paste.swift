@@ -775,11 +775,63 @@ func attachmentClipboardMatches(_ clipboard: NSPasteboard, count: Int, fileURL: 
 // No callback is retried. A stopped guard cannot progress to a clipboard write
 // or dispatch; a successful dispatch is never converted into insertion proof.
 func guardedAttachmentDispatch(beforeWrite: () throws -> Void, writeClipboard: () throws -> Void,
+                               prepareDispatch: () throws -> Void = {},
                                beforeDispatch: () throws -> Void, dispatch: () throws -> Bool) throws -> String {
     try beforeWrite()
     try writeClipboard()
+    try prepareDispatch()
     try beforeDispatch()
     return try dispatch() ? "paste_dispatched" : "paste_failed"
+}
+struct AttachmentMenuBudget {
+    let deadline: TimeInterval
+    var checks = 0
+    mutating func check(_ now: TimeInterval) throws {
+        checks += 1
+        guard now < deadline, checks <= 1024 else {
+            throw AXFailure(stage: "menu_paste_budget", code: .cannotComplete)
+        }
+    }
+}
+func attachmentPasteMenu(_ app: AXUIElement, expectedPid: pid_t, actionDeadline: Double) throws -> AXUIElement {
+    // The lookup's shorter IPC limit must not leak into final field checks.
+    defer { AXUIElementSetMessagingTimeout(app, 0.25) }
+    let remaining = actionDeadline / 1000 - Date().timeIntervalSince1970 - 0.3
+    var budget = AttachmentMenuBudget(deadline: ProcessInfo.processInfo.systemUptime + min(0.35, max(0, remaining)))
+    func read<T>(_ element: AXUIElement, _ operation: () throws -> T) throws -> T {
+        try budget.check(ProcessInfo.processInfo.systemUptime)
+        guard AXUIElementSetMessagingTimeout(element, 0.05) == .success else {
+            throw AXFailure(stage: "menu_paste_timeout", code: .cannotComplete)
+        }
+        let value = try operation()
+        try budget.check(ProcessInfo.processInfo.systemUptime)
+        return value
+    }
+    let menuBar = try read(app) { try elementAttribute(app, kAXMenuBarAttribute, "menu_bar") }
+    var matches: [AXUIElement] = []
+    for top in try read(menuBar, { try children(menuBar) }) {
+        for menu in try read(top, { try children(top) }) {
+            for item in try read(menu, { try children(menu) }) {
+                let identifier = try read(item) { try optionalString(item, kAXIdentifierAttribute, "menu_identifier") }
+                if identifier == "paste:" { matches.append(item) }
+            }
+        }
+    }
+    guard matches.count == 1, let item = matches.first,
+          try read(item, { try optionalBool(item, kAXEnabledAttribute, "menu_enabled") }) == true else {
+        throw AXFailure(stage: "menu_paste_unavailable", code: .noValue)
+    }
+    var owner: pid_t = 0
+    guard try read(item, { AXUIElementGetPid(item, &owner) }) == .success, owner == expectedPid else {
+        throw AXFailure(stage: "menu_paste_owner", code: .invalidUIElement)
+    }
+    var actions: CFArray?
+    let error = try read(item) { AXUIElementCopyActionNames(item, &actions) }
+    guard error == .success, let names = actions as? [String], names.contains(kAXPressAction) else {
+        throw AXFailure(stage: "menu_press_unavailable", code: error == .success ? .actionUnsupported : error)
+    }
+    AXUIElementSetMessagingTimeout(item, 0.25)
+    return item
 }
 func runAttachment(deadline: Double, originalPath: String, expectedHash: String, pngPath: String?,
                    owner: pid_t, expectedPid: pid_t) -> String {
@@ -789,9 +841,9 @@ func runAttachment(deadline: Double, originalPath: String, expectedHash: String,
     guard expectedPid > 1 else { return "no_focused_input" }
     guard AXIsProcessTrusted() else { note("ax_trust", -25211); return "permission_missing" }
     let isWorkBuddy = NSRunningApplication(processIdentifier: expectedPid)?.bundleIdentifier == "com.tencent.workbuddy.mac"
-    if !isWorkBuddy && !CGPreflightPostEventAccess() { note("key_trust", -25211); return "permission_missing" }
     let clipboard = NSPasteboard.general
     let initialClipboardCount = clipboard.changeCount
+    note("attachment_target_pid", expectedPid)
     let system = AXUIElementCreateSystemWide()
     AXUIElementSetMessagingTimeout(system, 0.25)
     do {
@@ -833,10 +885,7 @@ func runAttachment(deadline: Double, originalPath: String, expectedHash: String,
                 return "attachment_prepare_failed"
             }
         }
-        let menuItem = isWorkBuddy ? try pasteMenuItem(initial.app) : nil
-        let source = isWorkBuddy ? nil : CGEventSource(stateID: .combinedSessionState)
-        let keyEvents = source.flatMap(pasteKeyEvents)
-        guard isWorkBuddy || keyEvents != nil else { return "paste_failed" }
+        var menuItem: AXUIElement?
         let fileURL = URL(fileURLWithPath: original.path).absoluteString
         let item = NSPasteboardItem()
         guard item.setString(fileURL, forType: .fileURL) else { return "paste_failed" }
@@ -860,6 +909,26 @@ func runAttachment(deadline: Double, originalPath: String, expectedHash: String,
             guard clipboard.changeCount == clearedCount else { throw ActionStopped(result: "clipboard_changed") }
             guard clipboard.writeObjects([item]) else { throw ActionStopped(result: "paste_failed") }
             count = clipboard.changeCount
+        }, prepareDispatch: {
+            // Resolve the native Paste command after publishing the attachment:
+            // its enabled state may depend on the clipboard representation.
+            // Select exactly one route before final guards; never fall back
+            // after a menu action or key may have been delivered.
+            do {
+                menuItem = try attachmentPasteMenu(initial.app, expectedPid: expectedPid, actionDeadline: deadline)
+            } catch let error as AXFailure {
+                if isWorkBuddy { throw error }
+                note("attachment_menu_unavailable", error.code.rawValue)
+                menuItem = nil
+            }
+            note("attachment_route_menu", menuItem == nil ? 0 : 1)
+            if menuItem == nil && !CGPreflightPostEventAccess() {
+                note("key_trust", -25211)
+                throw ActionStopped(result: "permission_missing")
+            }
+            // Diagnostics and native menu lookup can perform IPC/file I/O.
+            // All final clipboard, field and deadline checks follow them.
+            note("attachment_dispatch_intent", 0)
         }, beforeDispatch: {
             guard attachmentClipboardMatches(clipboard, count: count, fileURL: fileURL, png: pngFile?.data) else {
                 throw ActionStopped(result: "clipboard_changed")
@@ -881,13 +950,19 @@ func runAttachment(deadline: Double, originalPath: String, expectedHash: String,
             }
             guard !expired(), !ownerGone() else { throw ActionStopped(result: "expired") }
         }, dispatch: {
-            note("attachment_dispatch_intent", 0)
             if let item = menuItem {
                 let error = AXUIElementPerformAction(item, kAXPressAction as CFString)
                 note("menu_paste_dispatch", error.rawValue)
                 return error == .success
             }
-            guard let events = keyEvents else { return false }
+            // Create keyboard events only when this route is about to dispatch.
+            guard let source = CGEventSource(stateID: .combinedSessionState),
+                  let events = pasteKeyEvents(source) else { return false }
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPid else {
+                throw ActionStopped(result: "focus_changed")
+            }
+            guard !expired() else { throw ActionStopped(result: "expired") }
+            guard !ownerGone() else { throw ActionStopped(result: "receiver_stopped") }
             for event in events { event.post(tap: .cghidEventTap) }
             note("key_paste_dispatch", 0)
             // AX field text cannot confirm attachment acceptance. No retry,
@@ -901,6 +976,31 @@ func runAttachment(deadline: Double, originalPath: String, expectedHash: String,
     catch { recordFocusFailure(error); return "paste_failed" }
 }
 func attachmentPureChecks() {
+    var menuBudget = AttachmentMenuBudget(deadline: 100)
+    try! menuBudget.check(99)
+    do { try menuBudget.check(100); preconditionFailure("menu lookup deadline must be bounded") }
+    catch let error as AXFailure { precondition(error.stage == "menu_paste_budget") }
+    catch { preconditionFailure("menu lookup must preserve its bounded failure") }
+    var exhaustedMenuBudget = AttachmentMenuBudget(deadline: 100, checks: 1024)
+    do { try exhaustedMenuBudget.check(99); preconditionFailure("menu lookup count must be bounded") }
+    catch let error as AXFailure { precondition(error.stage == "menu_paste_budget") }
+    catch { preconditionFailure("menu lookup must preserve its capacity failure") }
+    // Slow diagnostics/menu IPC must finish before the authoritative deadline
+    // guard. A stale preparation can never proceed to either paste route.
+    var preparationExpired = false
+    var preparedSteps: [Int] = []
+    do {
+        _ = try guardedAttachmentDispatch(beforeWrite: { preparedSteps.append(0) },
+            writeClipboard: { preparedSteps.append(1) },
+            prepareDispatch: { preparedSteps.append(2); preparationExpired = true },
+            beforeDispatch: {
+                preparedSteps.append(3)
+                if preparationExpired { throw ActionStopped(result: "expired") }
+            }, dispatch: { preconditionFailure("expired menu/diagnostic preparation cannot dispatch") })
+        preconditionFailure("the final guard must reject stale dispatch preparation")
+    } catch let error as ActionStopped {
+        precondition(error.result == "expired" && preparedSteps == [0, 1, 2, 3])
+    } catch { preconditionFailure("dispatch preparation must preserve its guard reason") }
     for stop in 0...2 {
         var steps: [Int] = []
         func step(_ current: Int) throws {
@@ -1370,6 +1470,20 @@ if CommandLine.arguments == [CommandLine.arguments[0], "--self-test"] {
     precondition(!lateRead.verified)
     attachmentPureChecks()
     print("pure guard/hash/focus-retry/insertion/attachment checks passed; no AX or clipboard access")
+} else if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--inspect-attachment-menu",
+          let target = Int32(CommandLine.arguments[2]), target > 1 {
+    // Read-only diagnostics: no focus/input query, clipboard access, activation
+    // or paste action. Useful even while the user continues working elsewhere.
+    if !AXIsProcessTrusted() { print("permission_missing") }
+    else {
+        let app = AXUIElementCreateApplication(target)
+        do {
+            _ = try attachmentPasteMenu(app, expectedPid: target,
+                                       actionDeadline: Date().timeIntervalSince1970 * 1000 + 5000)
+            print("menu_ready")
+        } catch let error as AXFailure { print(error.stage) }
+        catch { print("menu_paste_unavailable") }
+    }
 } else if CommandLine.arguments.count == 4, CommandLine.arguments[1] == "--prepare-attachment" {
     print(prepareAttachment(originalPath: CommandLine.arguments[2], pngPath: CommandLine.arguments[3]))
 } else if CommandLine.arguments.count == 8, CommandLine.arguments[1] == "--paste-attachment",

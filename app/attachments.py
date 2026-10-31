@@ -348,7 +348,7 @@ class AttachmentHub:
         now = self.clock()
         for room, (session_id, observed) in list(self.receivers.items()):
             current = self.signals.rooms.get(room)
-            if (now - observed >= 6 or current is None or not current.active or
+            if (now - observed >= self.signals.lease_seconds or current is None or not current.active or
                     current.session_id != session_id):
                 del self.receivers[room]
         for room, preparation in list(self.preparations.items()):
@@ -374,7 +374,8 @@ class AttachmentHub:
 
     def _ready(self, room, session_id):
         receiver = self.receivers.get(room)
-        return bool(receiver and receiver[0] == session_id and self.clock() - receiver[1] < 6)
+        return bool(receiver and receiver[0] == session_id and
+                    self.clock() - receiver[1] < self.signals.lease_seconds)
 
     def _outstanding(self, room):
         return any(a.room == room and a.status in {"accepted", "delivered"} for a in self.actions.values())

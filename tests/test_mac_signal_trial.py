@@ -35,10 +35,17 @@ class ActionConsumerTests(unittest.TestCase):
         self.paste.assert_not_called()
 
     def test_invalid_ttl_cannot_bypass_expiry(self):
-        for ttl in [float("nan"), float("inf"), True, "5000", 5001, 0, -1]:
+        for ttl in [float("nan"), float("inf"), True, "5000", 10001, 0, -1]:
             action = {**self.action, "action_id": str(uuid4()), "remaining_ms": ttl}
             self.assertEqual(self.consumer.consume(action, 11)[1:], ("cancelled", "expired"))
         self.paste.assert_not_called()
+
+    def test_ten_second_server_budget_is_accepted_but_never_renewed(self):
+        action = {**self.action, "remaining_ms": 10000}
+        self.assertEqual(self.consumer.consume(action, 3)[1:], ("executed", None))
+        self.paste.assert_called_once_with(13, 0.5)
+        self.assertIsNone(self.consumer.consume(action, 12))
+        self.paste.assert_called_once()
 
     def test_success_reports_only_command_execution(self):
         self.assertEqual(self.consumer.consume(self.action, 11)[1:], ("executed", None))

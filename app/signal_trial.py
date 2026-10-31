@@ -107,9 +107,9 @@ class Session:
 
 class SignalStore:
     def __init__(self, *, clock: Callable[[], float] = time.monotonic,
-                 poll_seconds: float = 1.0, lease_seconds: float = 6.0,
-                 action_seconds: float = 5.0, max_actions: int = 256,
-                 max_rooms: int = 128, receipt_seconds: float = 10.0,
+                 poll_seconds: float = 1.0, lease_seconds: float = 20.0,
+                 action_seconds: float = 10.0, max_actions: int = 256,
+                 max_rooms: int = 128, receipt_seconds: float = 20.0,
                  history_seconds: float = 120.0, max_previous_sessions: int = 4):
         self.clock = clock
         self.poll_seconds = min(max(poll_seconds, 0.0), 1.0)

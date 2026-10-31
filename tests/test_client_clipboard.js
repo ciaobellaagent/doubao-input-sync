@@ -232,7 +232,7 @@ test('offline archive persists, retries are bounded, reload saves idempotently w
   const copyId = writes(env)[0].body.copy_id;
   for (const delay of [1200, 2400, 4800, 9600]) assert.equal(await env.runTimeout(delay), true);
   assert.equal(writes(env).length, 5);
-  assert.equal(await env.runTimeout(15000), false);
+  assert.equal(await env.runTimeout(30000), false);
   assert.equal(pendingKeys(env.storage).length, 1);
   const reopened = boot({ storage: env.storage }); await settle();
   assert.equal(writes(reopened)[0].body.copy_id, copyId);
@@ -440,11 +440,11 @@ test('uncertain signal times out once; reconnect and reload replay archives only
   const env = boot({ copyFailure: true }); await settle();
   env.controls.hangEndpoints.add('/api/signal/action');
   env.input('未确认的动作'); await env.prepare(); env.click('copy-paste-button'); await settle();
-  assert.equal(await env.runTimeout(6000), true);
+  assert.equal(await env.runTimeout(12000), true);
   assert.match(env.get('signal-action-status').textContent, /不明确/);
   env.event('online'); await settle(); await env.tick(2000);
   assert.equal(signals(env).length, 1);
-  assert.equal(await env.runTimeout(15000), true);
+  assert.equal(await env.runTimeout(30000), true);
   assert.match(env.get('signal-action-status').textContent, /结果未知.*不会重发/);
   const reopened = boot({ storage: env.storage }); await settle(); await reopened.tick(2000);
   assert.equal(signals(reopened).length, 0);
@@ -629,7 +629,7 @@ test('unknown paste retains draft despite successful archive and after reload', 
   const env = boot(); await settle(); env.get('auto-clear-toggle').checked = true;
   env.controls.signalFailure = true;
   env.input('结果不明确仍保留'); await env.prepare(); env.click('copy-paste-button'); await settle();
-  await env.runTimeout(15000);
+  await env.runTimeout(30000);
   assert.match(env.get('signal-action-status').textContent, /结果未知.*草稿已保留/);
   assert.equal(env.get('mobile-editor').value, '结果不明确仍保留');
   const reopened = boot({ storage: env.storage }); await settle();
@@ -687,7 +687,7 @@ test('legacy receiver cannot dispatch queued paste; timeout releases copy-only',
   env.click('copy-paste-button'); await settle();
   assert.equal(signals(env).length, 0);
   assert.equal(writes(env).length, 1);
-  await env.runTimeout(15000);
+  await env.runTimeout(30000);
   assert.equal(env.get('copy-archive-button').disabled, false);
   assert.equal(env.get('mobile-editor').value, '旧接收器');
 });
@@ -777,7 +777,7 @@ test('older copy-only archive cannot clear a later failed paste of the same draf
 test('passive preparation failure never copies, clears or sends and releases manual fallback', async () => {
   const env = boot(); await settle(); env.controls.hangEndpoints.add('/api/signal/prepare');
   env.get('auto-clear-toggle').checked = true;
-  env.input('准备失败保留'); await env.prepare(); await env.runTimeout(6000);
+  env.input('准备失败保留'); await env.prepare(); await env.runTimeout(12000);
   assert.match(env.get('signal-receiver-status').textContent, /准备失败/);
   assert.equal(env.get('copy-paste-button').disabled, false);
   assert.equal(env.get('manual-mode-button').disabled, false);
@@ -867,7 +867,7 @@ test('executed receipt cannot clear text edited away and back to the same value'
 test('executed receipt after observation timeout cannot clear a retained draft', async () => {
   const env = boot(); await settle();
   env.input('未知时保留'); await env.prepare(); env.click('copy-paste-button'); await settle();
-  await env.runTimeout(15000);
+  await env.runTimeout(30000);
   env.controls.signalAction = { action_id: signals(env)[0].body.action_id, status: 'executed' }; await env.tick(2000);
   assert.equal(env.get('mobile-editor').value, '未知时保留');
   assert.match(env.get('signal-action-status').textContent, /已补收到执行回执/);
@@ -897,7 +897,7 @@ test('receiver deadline cancellation cannot claim the paste did not happen', asy
 test('late receipt after reconnect preserves newer typing and never sends another action', async () => {
   const env = boot(); await settle(); env.input('原内容'); await env.prepare();
   env.click('copy-paste-button'); await settle(); const id = signals(env)[0].body.action_id;
-  await env.runTimeout(15000); env.input('新的草稿');
+  await env.runTimeout(30000); env.input('新的草稿');
   env.controls.signalSession = 'new-receiver-session';
   env.controls.signalAction = { action_id: id, status: 'executed' }; await env.tick(2000);
   assert.match(env.get('signal-action-status').textContent, /已补收到执行回执/);
@@ -945,7 +945,7 @@ test('offline click waits and binds first ready receiver without another clipboa
 test('queued timeout preserves draft and never sends on late readiness or reload', async () => {
   const env = boot({ signalReady: false }); await settle();
   env.input('等待超时保留我'); env.click('copy-paste-button'); await settle();
-  assert.equal(await env.runTimeout(15000), true);
+  assert.equal(await env.runTimeout(30000), true);
   assert.equal(env.get('mobile-editor').value, '等待超时保留我');
   assert.equal(env.get('manual-mode-button').disabled, false);
   assert.match(env.get('signal-action-status').textContent, /超时|未就绪/);
@@ -955,6 +955,31 @@ test('queued timeout preserves draft and never sends on late readiness or reload
   assert.equal(signals(reopened).length, 0);
   assert.equal(reopened.get('mobile-editor').value, '等待超时保留我');
   assert.equal(env.calls.filter(c => c.kind === 'clipboard').length, 1);
+});
+
+test('preparation can finish after fifteen seconds but must dispatch before thirty', async () => {
+  for (const elapsed of [16000, 30000]) {
+    const env = boot({ signalReady: false }); await settle();
+    env.input('等待网络恢复'); env.click('copy-paste-button'); await settle();
+    assert.match(env.get('signal-action-status').textContent, /最多 30 秒/);
+    env.advance(elapsed);
+    env.controls.signalReady = true; await env.tick(2000); await env.prepare(); await env.tick(2000);
+    assert.equal(signals(env).length, elapsed < 30000 ? 1 : 0);
+    assert.equal(env.calls.filter(c => c.kind === 'clipboard').length, 1);
+    assert.equal(env.get('mobile-editor').value, '等待网络恢复');
+  }
+});
+
+test('result observation lasts thirty seconds and a result after fifteen can clear unchanged text', async () => {
+  const env = boot(); await settle(); env.input('稍迟的执行回执'); await env.prepare();
+  env.click('copy-paste-button'); await settle();
+  assert.equal(await env.runTimeout(15000), false);
+  env.advance(20000);
+  env.controls.signalAction = { action_id: signals(env)[0].body.action_id, status: 'executed' };
+  await env.tick(2000);
+  assert.equal(env.get('mobile-editor').value, '');
+  assert.equal(signals(env).length, 1);
+  assert.equal(await env.runTimeout(30000), false);
 });
 
 test('editing or clearing queued draft cancels paste even if the original text returns', async () => {
@@ -995,7 +1020,7 @@ test('receiver replacement cancels queued preparation and cannot paste into new 
 test('clipboard permission resolving after click deadline cannot dispatch even if timer was throttled', async () => {
   const env = boot(); await settle(); env.input('权限等待过久'); await env.prepare();
   env.controls.clipboardGate = deferred(); env.click('copy-paste-button');
-  env.advance(15001);
+  env.advance(30001);
   env.controls.clipboardGate.resolve(); await settle(); await env.tick(2000);
   assert.equal(signals(env).length, 0);
   assert.equal(writes(env).length, 1);
@@ -1006,7 +1031,7 @@ test('clipboard permission resolving after click deadline cannot dispatch even i
 test('late ready callback cannot dispatch an expired queue while browser timer is throttled', async () => {
   const env = boot(); await settle(); env.controls.prepareReady = false;
   env.input('后台计时器延迟'); env.click('copy-paste-button'); await settle(); await env.prepare();
-  env.advance(15001);
+  env.advance(30001);
   env.controls.preparation.ready = true; await env.tick(2000);
   assert.equal(signals(env).length, 0);
   assert.equal(env.get('mobile-editor').value, '后台计时器延迟');

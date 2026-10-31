@@ -337,6 +337,9 @@
   };
 
   const matchProtocol = "clipboard-match-v1";
+  const signalRequestTimeoutMs = 12000;
+  const signalQueueTimeoutMs = 30000;
+  const signalResultTimeoutMs = 30000;
 
   function preparationCurrent(preparation = state.signalPreparation) {
     return preparation && preparation.sessionId === state.signalSessionId &&
@@ -389,7 +392,7 @@
       const { response, payload } = await fetchJsonWithTimeout(appPath("/api/signal/prepare"), {
         method: "POST", headers: { "Content-Type": "application/json" }, cache: "no-store",
         body: JSON.stringify({ room_id: state.roomId, session_id: sessionId, preparation_id: preparation.preparation_id, sha256 }),
-      }, 6000);
+      }, signalRequestTimeoutMs);
       if (!current()) return;
       if (!response.ok || payload.ok === false) throw new Error("prepare_failed");
       state.signalPreparation = preparation;
@@ -512,7 +515,7 @@
     const pageGeneration = state.signalPageGeneration;
     try {
       const query = `?room=${encodeURIComponent(state.roomId)}${actionId ? `&action_id=${encodeURIComponent(actionId)}` : ""}`;
-      const { response, payload } = await fetchJsonWithTimeout(appPath(`/api/signal/status${query}`), { cache: "no-store" }, 6000);
+      const { response, payload } = await fetchJsonWithTimeout(appPath(`/api/signal/status${query}`), { cache: "no-store" }, signalRequestTimeoutMs);
       if (pageGeneration !== state.signalPageGeneration || !state.signalPageActive) return;
       if (!response.ok || payload.ok === false) throw new Error("signal_status_failed");
       const nextSession = payload.ready && payload.session_id ? payload.session_id : null;
@@ -545,7 +548,7 @@
       const { response, payload } = await fetchJsonWithTimeout(appPath("/api/signal/action"), {
         method: "POST", headers: { "Content-Type": "application/json" }, cache: "no-store",
         body: JSON.stringify({ room_id: state.roomId, session_id: sessionId, action_id: id, preparation_id: preparationId }),
-      }, 6000);
+      }, signalRequestTimeoutMs);
       if (state.signalActionId !== id || !state.signalActionPending) return;
       if (!response.ok || payload.ok === false) {
         if (response.status >= 500 || [408, 425, 429].includes(response.status)) throw new Error("signal_uncertain");
@@ -608,7 +611,7 @@
     state.signalActionTimer = window.setTimeout(function () {
       finishSignalAction(actionId, "粘贴结果未知，不会重发 · 草稿已保留；请先检查电脑，未粘贴可切换换气发送");
       state.signalActionLate = state.signalActionId === actionId;
-    }, 15000);
+    }, signalResultTimeoutMs);
     void sendSignalAction(actionId, sessionId, preparation.preparation_id);
     updateManualSendAvailability();
   }
@@ -630,7 +633,7 @@
     const copyGeneration = state.syncGeneration;
     const sessionId = state.signalSessionId;
     const pageGeneration = state.signalPageGeneration;
-    const queueDeadline = Date.now() + 15000;
+    const queueDeadline = Date.now() + signalQueueTimeoutMs;
     if (!withAction) invalidatePreparation();
     const clipboardWrite = writeClipboardFromGesture(textSnapshot);
     state.copyPending = true;
@@ -661,7 +664,7 @@
       if (withAction) {
         state.signalQueuedPaste = { text: textSnapshot, revision: draftRevision,
           generation: copyGeneration, room: item.room_id, sessionId, pageGeneration, deadline: queueDeadline };
-        signalActionStatus.textContent = "已复制 · 等待电脑就绪，就绪后自动粘贴（最多 15 秒）…";
+        signalActionStatus.textContent = "已复制 · 等待电脑就绪，就绪后自动粘贴（最多 30 秒）…";
         signalActionStatus.dataset.status = "pending";
         state.signalQueueTimer = window.setTimeout(function () {
           cancelQueuedPaste("等待电脑就绪超时 · 没有发送粘贴指令；草稿已保留，可切换换气发送");
@@ -1163,7 +1166,7 @@
     clipboardModeButton.setAttribute("aria-pressed", isClipboard ? "true" : "false");
 
     if (isClipboard) {
-      captureModeHint.textContent = "说完即可点复制并粘贴；电脑未就绪时自动等最多 15 秒，匹配后粘贴。等待时修改文字会取消；执行后清空，失败或超时保留，可切换换气发送。";
+      captureModeHint.textContent = "说完即可点复制并粘贴；电脑未就绪时自动等最多 30 秒，匹配后粘贴。等待时修改文字会取消；执行后清空，失败或超时保留，可切换换气发送。";
       mobilePanelHint.textContent = "豆包同步文字，一次点击完成复制与电脑粘贴";
       archiveHint.textContent = "剪贴板模式的记录保存在上方“复制留档”";
     } else if (isManual) {

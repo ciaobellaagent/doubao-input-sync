@@ -53,19 +53,24 @@ class ControlApiError(ApiError):
 
 class ControlApi(Api):
     """Production-only bounded timeouts; legacy probe defaults stay unchanged."""
-    def __init__(self, base, request_timeout=8.0):
+    def __init__(self, base, request_timeout=12.0):
         super().__init__(base)
         if not math.isfinite(request_timeout) or not 0 < request_timeout <= 30:
             raise ValueError("control_timeout_must_be_0_to_30_seconds")
         self.request_timeout = request_timeout
 
-    def request(self, name, payload=None, query=None):
+    def request(self, name, payload=None, query=None, *, timeout_seconds=None):
+        request_timeout = self.request_timeout
+        if timeout_seconds is not None:
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                raise ValueError("request_timeout_must_be_positive_finite")
+            request_timeout = min(request_timeout, timeout_seconds)
         url = self.base + "/api/signal/" + name
         if query:
             url += "?" + urlencode(query)
         command = ["/usr/bin/curl", "-sS", "--noproxy", "*", "--http1.1",
-                   "--max-time", str(self.request_timeout),
-                   "--connect-timeout", str(min(6.0, self.request_timeout)),
+                   "--max-time", str(request_timeout),
+                   "--connect-timeout", str(request_timeout),
                    "--max-redirs", "0", "--max-filesize", "16384",
                    "-w", "\n%{http_code}", "-H", "Accept: application/json"]
         body = None
@@ -76,7 +81,7 @@ class ControlApi(Api):
         diagnostic = {"endpoint": name, "outcome": "ok"}
         try:
             result = subprocess.run(command + [url], input=body, text=True, capture_output=True,
-                                    timeout=self.request_timeout + 1)
+                                    timeout=request_timeout + 1)
             if result.returncode:
                 diagnostic.update(outcome="transport_failed", curl_code=result.returncode)
                 raise ApiError("transport_failed")
@@ -344,7 +349,7 @@ class MatchConsumer:
         # Consume before waiting, including on invalid/expired budgets.
         self.seen[action_id] = (action_id, "cancelled", "expired")
         remaining = action.get("remaining_ms")
-        if type(remaining) not in {int, float} or not math.isfinite(remaining) or not 0 < remaining <= 5000:
+        if type(remaining) not in {int, float} or not math.isfinite(remaining) or not 0 < remaining <= 10000:
             return self.seen[action_id]
         deadline = poll_started + remaining / 1000
         trace("action_start", action_id=action_id, remaining_ms=(deadline - self.monotonic()) * 1000)
@@ -458,11 +463,52 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
             attachment_actor = None
             session_lost = threading.Event()
             try:
+                registration_started = time.monotonic()
                 registration = api.request("register", {"room_id": room, "protocol": PROTOCOL})
                 session_id, token = registration["session_id"], registration["receiver_token"]
                 if not uuid_string(session_id) or not isinstance(token, str) or not token or registration.get("protocol") != PROTOCOL:
                     raise ApiError("invalid_registration")
                 identity = {"room_id": room, "session_id": session_id, "receiver_token": token}
+                # A brief transport outage must not discard this session's
+                # consumed-action set or interrupt a paste already authorized.
+                # Retry only authenticated passive control operations, within
+                # a fixed conservative lease window. The server remains the
+                # authority on whether the session is still active.
+                last_poll_started = registration_started
+
+                def passive_request(name, payload):
+                    recovery_deadline = last_poll_started + 20.0
+                    retrying = False
+                    last_error = None
+                    while True:
+                        started = time.monotonic()
+                        if retrying:
+                            remaining = recovery_deadline - started
+                            if stopped() or remaining <= 0:
+                                raise last_error
+                        try:
+                            response = (api.request(name, payload, timeout_seconds=remaining)
+                                        if retrying else api.request(name, payload))
+                            if retrying and (stopped() or time.monotonic() >= recovery_deadline):
+                                raise ApiError("transport_failed")
+                            return response, started
+                        except (ApiError, subprocess.TimeoutExpired) as error:
+                            # HTTP/auth/session/protocol failures are not
+                            # transport ambiguity and retain normal rotation.
+                            transient = (isinstance(error, subprocess.TimeoutExpired) or
+                                         type(error) is ApiError and str(error) == "transport_failed")
+                            if not transient:
+                                raise
+                            last_error = error
+                            remaining = recovery_deadline - time.monotonic()
+                            if stopped() or remaining <= 0:
+                                raise
+                            trace("disconnected", outcome="process_timeout" if isinstance(error, subprocess.TimeoutExpired)
+                                  else "transport_failed")
+                            emit("control_retry", operation=name)
+                            stop_event.wait(min(1.0, remaining))
+                            retrying = True
+
                 attachment_actor = AttachmentActor(api.base, identity, action_lock,
                     lambda: stopped() or session_lost.is_set()).start()
                 watcher = PassiveWatcher()
@@ -494,19 +540,19 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                     # that job runs so its lease remains valid.
                     if (len(submitted) >= MAX_ACTIONS_PER_SESSION or attachment_actor.exhausted) and job is None:
                         break
-                    started = time.monotonic()
-                    response = api.request("poll", identity)
+                    response, started = passive_request("poll", identity)
                     received_at = time.monotonic()
                     if response.get("session_id") != session_id:
                         raise ApiError("session_changed")
                     if stopped():
                         break
+                    last_poll_started = started
                     preparation = response.get("preparation")
                     if preparation:
                         if not consumer.prepare(preparation):
                             raise ApiError("preparation_failed")
                         try:
-                            api.request("prepared", {**identity, "preparation_id": preparation["preparation_id"]})
+                            passive_request("prepared", {**identity, "preparation_id": preparation["preparation_id"]})
                         except ControlApiError as error:
                             if error.http_status != 409 or error.error_code != "preparation_mismatch":
                                 raise
@@ -609,7 +655,7 @@ def main():
     parser.add_argument("--server-url", required=True)
     parser.add_argument("--room", required=True)
     parser.add_argument("--duration", type=int, default=0, help="0 keeps receiver running until stopped")
-    parser.add_argument("--control-timeout-seconds", type=float, default=8.0)
+    parser.add_argument("--control-timeout-seconds", type=float, default=12.0)
     parser.add_argument("--relay-timeout-seconds", type=float, default=6.0)
     args = parser.parse_args()
     if args.duration < 0:

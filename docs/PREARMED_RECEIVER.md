@@ -19,7 +19,7 @@ The installer writes its binary and build receipt beneath `~/Library/Application
 
 1. Phone typing prepares an exact UTF-8 SHA-256 fingerprint.
 2. The receiver starts passive clipboard observation and reports preparation readiness. This cannot paste.
-3. A successful phone copy plus explicit click authorizes one action, bound to that preparation and receiver session. The phone may wait up to 15 seconds before dispatch.
+3. A successful phone copy plus explicit click authorizes one action, bound to that preparation and receiver session. The phone may wait up to 30 seconds before dispatch.
 4. The Mac checks the deadline, clipboard text/hash/change count, foreground process, window, editable input and modifier keys, then triggers at most one paste.
 5. The result returns to the phone. Failure/uncertainty retains the draft; an executed receipt clears only the unchanged submitted text.
 
@@ -97,6 +97,44 @@ The extra System Events frontmost query used only to compare diagnostic PIDs has
 been removed. NSWorkspace remains the target source; all exact field/window,
 clipboard, modifier and deadline guards remain.
 
-A conservative budget still subtracts the entire poll duration, including server
-waiting. These latency changes do not alter that protocol rule or the five-second
-server lifetime. They cannot guarantee paste when the desktop is heavily loaded.
+The text action has a fixed ten-second lifetime from server acceptance. The Mac
+credits only valid, bounded `poll_wait_ms` measured by the trusted server and
+still deducts other request overhead, local queues, locks and execution. Missing
+or invalid timing metadata retains the conservative full-request debit. No
+receipt, retry or reconnect renews dispatch authorization.
+
+## Network timing defaults
+
+| Stage | Limit | Starts at |
+| --- | --- | --- |
+| Phone waits for matching preparation | 30 s | Explicit copy-and-paste click |
+| Phone signal HTTP request | 12 s | Each request |
+| Mac signal HTTP request / connection | 12 s | Each request; recovery may clip it |
+| Receiver lease | 20 s | Last server-completed text signal poll |
+| Text dispatch authorization | 10 s | Server accepts the action |
+| Phone result observation | 30 s | Phone starts its one action request |
+| Server receipt collection | 20 s after dispatch deadline | Result only; 30 s after acceptance |
+
+These are upper bounds, not added delays. Text preparation itself remains valid
+for 60 seconds and status polling stays at two-second intervals. The independent
+preparation and result waits mean the full interaction can exceed 30 seconds.
+
+Transient poll/prepared failures may retry within the same receiver session's
+conservative 20-second recovery window. Retries retain the same consumer and
+consumed action IDs. Each retry request is clipped to the remaining recovery
+window; authentication/session errors still end the session. A lost poll response
+is never replayed by the server. ACK retries send only the fixed result, never
+another paste; a result arriving after the receipt cutoff remains unknown.
+
+Focus is captured when the Mac begins the authorized operation, not when the
+phone button is pressed. Switching inputs before that capture can select the
+new input. After capture, the existing exact process/window/input, clipboard,
+modifier and deadline checks still apply. A longer window is not a guarantee
+under severe desktop load or prolonged network loss.
+
+Attachment receiver readiness follows the same 20-second lease. Attachment
+preparation, network calls, five-second action and separate 15-second receipt
+window otherwise retain their independent limits; ordinary relay sends retain
+their existing timing. Refresh an already-open phone page after an upgrade to
+load the new text UI timeouts. An expired/uncertain result preserves the draft
+and never automatically retries a paste.

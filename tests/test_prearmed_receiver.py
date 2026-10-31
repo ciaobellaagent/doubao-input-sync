@@ -20,9 +20,9 @@ class ProductionConnectionTests(unittest.TestCase):
         with patch.object(receiver.subprocess, "run", return_value=Mock(returncode=0, stdout='{"ok": true}\n200')) as run:
             receiver.ControlApi("http://local/doubao").request("status", query={"room": "air"})
             production_args = run.call_args.args[0]
-            self.assertEqual(production_args[production_args.index("--max-time") + 1], "8.0")
-            self.assertEqual(production_args[production_args.index("--connect-timeout") + 1], "6.0")
-            self.assertEqual(run.call_args.kwargs["timeout"], 9.0)
+            self.assertEqual(production_args[production_args.index("--max-time") + 1], "12.0")
+            self.assertEqual(production_args[production_args.index("--connect-timeout") + 1], "12.0")
+            self.assertEqual(run.call_args.kwargs["timeout"], 13.0)
             receiver.Api("http://local/doubao").request("status", query={"room": "air"})
             legacy_args = run.call_args.args[0]
             self.assertEqual(legacy_args[legacy_args.index("--max-time") + 1], "4")
@@ -48,6 +48,21 @@ class ProductionConnectionTests(unittest.TestCase):
         with patch.object(receiver.subprocess, "run", return_value=Mock(returncode=0, stdout='{"ok": true}\n200')) as run:
             receiver.ControlApi("http://local", 10).request("status")
             self.assertEqual(run.call_args.kwargs["timeout"], 11)
+
+    def test_recovery_timeout_clips_each_request_without_mutating_shared_api(self):
+        api = receiver.ControlApi("http://local", 12)
+        with patch.object(receiver.subprocess, "run", return_value=Mock(returncode=0, stdout='{"ok": true}\n200')) as run:
+            api.request("poll", {}, timeout_seconds=2.5)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--max-time") + 1], "2.5")
+            self.assertEqual(command[command.index("--connect-timeout") + 1], "2.5")
+            self.assertEqual(run.call_args.kwargs["timeout"], 3.5)
+            self.assertEqual(api.request_timeout, 12)
+            api.request("poll", {}, timeout_seconds=25)
+            self.assertEqual(run.call_args.kwargs["timeout"], 13)
+        for value in (0, -1, float("inf"), float("nan")):
+            with self.assertRaises(ValueError):
+                api.request("poll", {}, timeout_seconds=value)
 
     def test_startup_retries_before_exclusive_lifecycle(self):
         api, stop = Mock(), threading.Event()
@@ -187,10 +202,20 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(self.paste.call_count, 5)
 
     def test_invalid_or_elapsed_budget_never_pastes(self):
-        for remaining in (float("nan"), float("inf"), True, "5000", 5001, 0, -1, 999):
+        for remaining in (float("nan"), float("inf"), True, "5000", 10001, 0, -1, 999):
             action = {**self.action, "action_id": str(uuid4()), "remaining_ms": remaining}
             self.assertEqual(self.consumer.consume(action, 11)[1:], ("cancelled", "expired"))
         self.paste.assert_not_called()
+
+    def test_ten_second_action_keeps_first_deadline_and_never_repeats_paste(self):
+        action = {**self.action, "remaining_ms": 10000}
+        # Nine seconds of request/local waiting still leave one second, rather
+        # than rejecting the new server budget as malformed or renewing it.
+        result = self.consumer.consume(action, 3)
+        self.assertEqual(result[1:], ("executed", None))
+        self.paste.assert_called_once_with(13, self.prep["sha256"])
+        self.assertEqual(self.consumer.consume(action, 12), result)
+        self.paste.assert_called_once()
 
     def test_uncertain_native_failure_consumed(self):
         self.paste.side_effect = RuntimeError("uncertain")
@@ -244,7 +269,7 @@ class PollBudgetWireTests(unittest.TestCase):
             self.assertTrue(consumer.prepare(preparation))
             result = consumer.consume(response["action"], start)
             self.assertEqual(result[1:], ("executed", None))
-            self.assertLessEqual(paste.call_args.args[0], received + 5)
+            self.assertLessEqual(paste.call_args.args[0], received + store.action_seconds)
             self.assertEqual(api.request("ack", {**identity, "action_id": action_id, "status": "executed"})["action"]["status"], "executed")
             self.assertEqual(consumer.consume(response["action"], received + 100), result)
             paste.assert_called_once()
@@ -401,8 +426,8 @@ class ReceiveProtocolTests(unittest.TestCase):
                   receiver.ControlApiError(409, "poll_in_progress"),
                   receiver.ControlApiError(500, "preparation_mismatch"),
                   receiver.ControlApiError(409, "unknown"),
-                  receiver.ApiError("transport_failed"),
-                  subprocess.TimeoutExpired("curl", 9)]
+                  receiver.ApiError("invalid_response"),
+                  receiver.ApiError("unknown")]
         for error in errors:
             with self.subTest(error=repr(error), status=getattr(error, "http_status", None)):
                 stop = threading.Event()
@@ -432,6 +457,240 @@ class ReceiveProtocolTests(unittest.TestCase):
                 self.assertEqual(requests, ["register", "poll", "prepared", "unregister", "register", "unregister"])
                 self.assertIn("disconnected", [call.args[0] for call in emit.call_args_list])
                 paste.assert_not_called()
+
+    def test_transient_poll_and_prepared_failures_recover_same_real_store_session(self):
+        from app.signal_trial import SignalStore
+        for operation in ("poll", "prepared"):
+            for error in (receiver.ApiError("transport_failed"), subprocess.TimeoutExpired("curl", 12)):
+                with self.subTest(operation=operation, error=type(error).__name__):
+                    now = [100.0]
+                    store = SignalStore(clock=lambda: now[0], poll_seconds=0, lease_seconds=20)
+                    stop = threading.Event()
+                    requests, retried_timeouts = [], []
+                    preparation_id = str(uuid4())
+                    registration = None
+                    failed = False
+                    ready_before_stop = None
+                    api = Mock(base="http://local/doubao")
+
+                    def request(name, payload, **kwargs):
+                        nonlocal registration, failed, ready_before_stop
+                        requests.append(name)
+                        if kwargs:
+                            retried_timeouts.append(kwargs["timeout_seconds"])
+                        if name == "register":
+                            registration = store.register("air", receiver.PROTOCOL)
+                            store.prepare("air", registration["session_id"], preparation_id, "a" * 64)
+                            return registration
+                        self.assertEqual(payload["session_id"], registration["session_id"])
+                        self.assertEqual(payload["receiver_token"], registration["receiver_token"])
+                        if name == "poll":
+                            result = store.poll("air", payload["session_id"], payload["receiver_token"])
+                        elif name == "prepared":
+                            result = store.prepared("air", payload["session_id"], payload["receiver_token"], payload["preparation_id"])
+                        elif name == "unregister":
+                            return store.unregister("air", payload["session_id"], payload["receiver_token"])
+                        else:
+                            self.fail("unexpected operation: " + name)
+                        # The server completed the request, but its response was
+                        # lost. Passive retry is safe even for a committed ACK.
+                        if name == operation and not failed:
+                            failed = True
+                            now[0] += 4
+                            raise error
+                        if name == "prepared":
+                            ready_before_stop = store.status("air")
+                            stop.set()
+                        return result
+
+                    api.request.side_effect = request
+                    watcher = Mock()
+                    watcher.prepare.return_value = True
+                    def wait(seconds):
+                        now[0] += seconds
+                        return stop.is_set()
+                    with patch.object(receiver.time, "monotonic", side_effect=lambda: now[0]), \
+                            patch.object(stop, "wait", side_effect=wait), \
+                            patch.object(receiver, "PassiveWatcher", return_value=watcher), \
+                            patch.object(receiver, "relay_worker"), \
+                            patch.object(receiver, "paste_matching") as paste, \
+                            patch.object(receiver, "emit"):
+                        receiver.receive(api, "air", stop)
+                    expected = (["register", "poll", "poll", "prepared", "unregister"] if operation == "poll"
+                                else ["register", "poll", "prepared", "prepared", "unregister"])
+                    self.assertEqual(requests, expected)
+                    self.assertEqual(retried_timeouts, [15.0])
+                    self.assertTrue(ready_before_stop["ready"])
+                    self.assertTrue(ready_before_stop["preparation"]["ready"])
+                    watcher.prepare.assert_called_once()
+                    paste.assert_not_called()
+
+    def test_transport_recovery_window_is_fixed_and_request_time_is_clipped(self):
+        from app.signal_trial import SignalStore
+        now = [100.0]
+        store = SignalStore(clock=lambda: now[0], poll_seconds=0, lease_seconds=20)
+        stop = threading.Event()
+        requests, budgets = [], []
+        api = Mock(base="http://local/doubao")
+
+        def request(name, payload, **kwargs):
+            requests.append(name)
+            if name == "register":
+                return store.register("air", receiver.PROTOCOL)
+            if name == "poll":
+                budget = kwargs.get("timeout_seconds", 12.0)
+                budgets.append(budget)
+                now[0] += min(6.0, budget)
+                raise receiver.ApiError("transport_failed")
+            if name == "unregister":
+                stop.set()
+                return {"ok": True}
+            self.fail("unexpected operation: " + name)
+
+        api.request.side_effect = request
+        def wait(seconds):
+            now[0] += seconds
+            return stop.is_set()
+        with patch.object(receiver.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(stop, "wait", side_effect=wait), \
+                patch.object(receiver, "PassiveWatcher"), \
+                patch.object(receiver, "relay_worker"), \
+                patch.object(receiver, "paste_matching") as paste, \
+                patch.object(receiver, "emit"):
+            receiver.receive(api, "air", stop)
+        self.assertEqual(requests, ["register", "poll", "poll", "poll", "unregister"])
+        self.assertEqual(budgets, [12.0, 13.0, 6.0])
+        self.assertEqual(now[0], 120.0)
+        self.assertFalse(store.status("air")["ready"])
+        paste.assert_not_called()
+
+    def test_poll_recovery_does_not_cancel_or_repeat_an_already_delivered_action(self):
+        from app.signal_trial import SignalStore
+        now = [100.0]
+        store = SignalStore(clock=lambda: now[0], poll_seconds=0, lease_seconds=20, action_seconds=10)
+        stop = threading.Event()
+        native_started, recovered = threading.Event(), threading.Event()
+        requests, deadlines = [], []
+        preparation_id, action_id = str(uuid4()), str(uuid4())
+        api = Mock(base="http://local/doubao")
+        poll_count = 0
+
+        def request(name, payload, **kwargs):
+            nonlocal poll_count
+            requests.append(name)
+            if name == "register":
+                result = store.register("air", receiver.PROTOCOL)
+                store.prepare("air", result["session_id"], preparation_id, "a" * 64)
+                return result
+            if name == "prepared":
+                result = store.prepared("air", payload["session_id"], payload["receiver_token"], preparation_id)
+                store.action("air", payload["session_id"], action_id, preparation_id)
+                return result
+            if name == "poll":
+                poll_count += 1
+                if poll_count == 3:
+                    self.assertTrue(native_started.wait(1))
+                    now[0] += 1
+                    raise receiver.ApiError("transport_failed")
+                result = store.poll("air", payload["session_id"], payload["receiver_token"])
+                if poll_count >= 4:
+                    self.assertIsNone(result["action"], "delivered actions cannot be replayed")
+                    recovered.set()
+                    stop.wait(0.001)
+                return result
+            if name == "ack":
+                self.assertEqual(payload["status"], "executed")
+                result = store.ack("air", payload["session_id"], payload["receiver_token"], action_id, payload["status"])
+                stop.set()
+                return result
+            if name == "unregister":
+                return store.unregister("air", payload["session_id"], payload["receiver_token"])
+            self.fail("unexpected operation: " + name)
+
+        def paste(deadline, fingerprint, stopped):
+            deadlines.append(deadline)
+            native_started.set()
+            self.assertTrue(recovered.wait(1))
+            self.assertFalse(stopped())
+            return "executed"
+
+        api.request.side_effect = request
+        watcher = Mock()
+        watcher.prepare.return_value = True
+        def wait(seconds):
+            now[0] += seconds
+            # Yield to the action worker without making the recovery's logical
+            # one-second backoff race its separate synchronization timeout.
+            time.sleep(0.001)
+            return stop.is_set()
+        with patch.object(receiver.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(stop, "wait", side_effect=wait), \
+                patch.object(receiver, "PassiveWatcher", return_value=watcher), \
+                patch.object(receiver, "relay_worker"), \
+                patch.object(receiver, "paste_matching", side_effect=paste) as native, \
+                patch.object(receiver, "emit"):
+            receiver.receive(api, "air", stop)
+        self.assertEqual(requests.count("register"), 1)
+        self.assertEqual(requests.count("ack"), 1)
+        self.assertEqual(requests.count("unregister"), 1)
+        self.assertEqual(deadlines, [110.0])
+        native.assert_called_once()
+
+    def test_recovery_reply_after_fixed_window_cannot_dispatch_a_fresh_action(self):
+        from app.signal_trial import SignalStore
+        now = [100.0]
+        store = SignalStore(clock=lambda: now[0], poll_seconds=0, lease_seconds=20, action_seconds=10)
+        stop = threading.Event()
+        requests = []
+        preparation_id, action_id = str(uuid4()), str(uuid4())
+        api = Mock(base="http://local/doubao")
+        poll_count = 0
+
+        def request(name, payload, **kwargs):
+            nonlocal poll_count
+            requests.append(name)
+            if name == "register":
+                result = store.register("air", receiver.PROTOCOL)
+                store.prepare("air", result["session_id"], preparation_id, "a" * 64)
+                return result
+            if name == "prepared":
+                return store.prepared("air", payload["session_id"], payload["receiver_token"], preparation_id)
+            if name == "poll":
+                poll_count += 1
+                if poll_count == 2:
+                    now[0] += 12
+                    raise receiver.ApiError("transport_failed")
+                if poll_count == 3:
+                    self.assertEqual(kwargs["timeout_seconds"], 7.0)
+                    now[0] = 119.0
+                    store.action("air", payload["session_id"], action_id, preparation_id)
+                result = store.poll("air", payload["session_id"], payload["receiver_token"])
+                if poll_count == 3:
+                    # Even a valid authorization may not revive a local session
+                    # after the fixed recovery boundary has already elapsed.
+                    self.assertEqual(result["action"]["remaining_ms"], 10000)
+                    now[0] = 121.0
+                return result
+            if name == "unregister":
+                stop.set()
+                return store.unregister("air", payload["session_id"], payload["receiver_token"])
+            self.fail("unexpected operation: " + name)
+
+        api.request.side_effect = request
+        watcher = Mock()
+        watcher.prepare.return_value = True
+        def wait(seconds):
+            now[0] += seconds
+            return stop.is_set()
+        with patch.object(receiver.time, "monotonic", side_effect=lambda: now[0]), \
+                patch.object(stop, "wait", side_effect=wait), \
+                patch.object(receiver, "PassiveWatcher", return_value=watcher), \
+                patch.object(receiver, "relay_worker"), \
+                patch.object(receiver, "paste_matching") as paste, \
+                patch.object(receiver, "emit"):
+            receiver.receive(api, "air", stop)
+        self.assertEqual(requests, ["register", "poll", "prepared", "poll", "poll", "unregister"])
+        paste.assert_not_called()
 
     def test_prepare_ack_precedes_click_and_only_click_dispatches(self):
         session, preparation_id, action_id = (str(uuid4()) for _ in range(3))

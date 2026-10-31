@@ -305,9 +305,14 @@ class AttachmentHubTests(AttachmentTests):
         self.assertEqual(self.poll(), {"ok": True, "preparation": None, "action": None})
         self.assertTrue(self.hub.status("room")["receiver"]["ready"])
         self.clock.now += 6
+        self.assertTrue(self.hub.status("room")["receiver"]["ready"])
+        self.clock.now += 14
         self.assertFalse(self.hub.status("room")["receiver"]["ready"])
 
     def test_receiver_readiness_capacity_reclaims_expired_rooms_without_erasing_actions(self):
+        # A configurable short lease can expire before the independent 15s
+        # attachment receipt window; readiness must follow the shared lease.
+        self.signals.lease_seconds = 6
         self.hub.max_rooms = 1
         self.ready()
         action_id = self.action()["action"]["action_id"]
@@ -426,7 +431,7 @@ class AttachmentHubTests(AttachmentTests):
 
     def test_attachment_poll_never_renews_main_signal_lease(self):
         self.poll()
-        self.clock.now += 5
+        self.clock.now += 19
         self.poll()
         self.assertTrue(self.hub.status("room")["receiver"]["ready"])
         self.clock.now += 1

@@ -25,10 +25,63 @@ class Clock:
         return self.now
 
 
-class SignalStoreTests(unittest.TestCase):
+class NetworkToleranceTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.store = SignalStore(clock=self.clock, poll_seconds=0)
+        identity = self.store.register("demo")
+        self.session, self.token = identity["session_id"], identity["receiver_token"]
+
+    def test_twenty_second_lease_is_not_renewed_by_phone_status(self):
+        self.clock.now += 19.99
+        self.assertTrue(self.store.status("demo")["ready"])
+        self.clock.now = 120
+        self.assertFalse(self.store.status("demo")["ready"])
+
+    def test_delayed_delivery_and_duplicate_do_not_renew_ten_second_action(self):
+        action_id = str(uuid4())
+        self.store.action("demo", self.session, action_id)
+        self.clock.now += 7
+        self.store.action("demo", self.session, action_id)
+        action = self.store.poll("demo", self.session, self.token)["action"]
+        self.assertEqual(action["remaining_ms"], 3000)
+        self.assertIsNone(self.store.poll("demo", self.session, self.token)["action"])
+        # A separate action not delivered until the boundary cannot paste.
+        self.store.ack("demo", self.session, self.token, action_id, "executed")
+        next_id = str(uuid4())
+        self.store.action("demo", self.session, next_id)
+        self.clock.now += 10
+        self.assertIsNone(self.store.poll("demo", self.session, self.token)["action"])
+        self.assertEqual(self.store.status("demo", next_id)["action"]["status"], "expired")
+
+    def test_receipt_until_thirty_seconds_is_result_only_and_never_renews_lease(self):
+        action_id = str(uuid4())
+        self.store.action("demo", self.session, action_id)
+        self.store.poll("demo", self.session, self.token)
+        self.clock.now += 29
+        self.assertFalse(self.store.status("demo")["ready"])
+        result = self.store.ack("demo", self.session, self.token, action_id, "executed")
+        self.assertEqual(result["action"]["status"], "executed")
+        with self.assertRaises(SignalError):
+            self.store.poll("demo", self.session, self.token)
+
+    def test_receipt_at_thirty_second_boundary_cannot_overwrite_expired_result(self):
+        action_id = str(uuid4())
+        self.store.action("demo", self.session, action_id)
+        self.store.poll("demo", self.session, self.token)
+        self.clock.now += 30
+        with self.assertRaises(SignalError) as caught:
+            self.store.ack("demo", self.session, self.token, action_id, "executed")
+        self.assertEqual(caught.exception.reason, "action_already_finished")
+        self.assertEqual(self.store.status("demo", action_id)["action"]["status"], "expired")
+
+
+class SignalStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        # Keep the original shorter configurations under regression coverage;
+        # NetworkToleranceTests exercises the new production defaults above.
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=0)
         self.room = "signal-trial-test"
 
     def register(self):
@@ -97,7 +150,7 @@ class SignalStoreTests(unittest.TestCase):
         self.assertEqual(self.store.rooms[self.room].actions[action_id].deadline, deadline)
 
     def test_wait_waking_for_a_new_action_credits_only_wait_and_preserves_ttl(self):
-        self.store = SignalStore(clock=self.clock, poll_seconds=1)
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=1)
         self.register()
         action_id = str(uuid4())
         def notified(_timeout):
@@ -123,7 +176,7 @@ class SignalStoreTests(unittest.TestCase):
     def test_spurious_waits_accumulate_before_flooring_and_respect_both_caps(self):
         for allowance, expected in ((1.0, 1000), (0.25, 250)):
             with self.subTest(allowance=allowance):
-                self.store = SignalStore(clock=self.clock, poll_seconds=allowance)
+                self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=allowance)
                 self.register()
                 action_id = str(uuid4())
                 count = 0
@@ -146,7 +199,7 @@ class SignalStoreTests(unittest.TestCase):
                 self.assertEqual(response["action"]["remaining_ms"], 5000)
         # Fractional milliseconds accumulate before rounding; three individual
         # waits shorter than 1ms are not each rounded away.
-        self.store = SignalStore(clock=self.clock, poll_seconds=1)
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=1)
         self.register()
         action_id = str(uuid4())
         count = 0
@@ -164,7 +217,7 @@ class SignalStoreTests(unittest.TestCase):
         self.assertEqual(response["poll_wait_ms"], 1)
 
     def test_timed_out_empty_poll_reports_observed_wait_without_changing_lease_rules(self):
-        self.store = SignalStore(clock=self.clock, poll_seconds=0.25)
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=0.25)
         self.register()
         with patch.object(self.store.changed, "wait", return_value=False) as waiting, \
                 patch("app.signal_trial.time.monotonic", side_effect=[50.0, 50.0, 50.3]), \
@@ -192,7 +245,7 @@ class SignalStoreTests(unittest.TestCase):
     def test_expiry_on_status_before_and_after_delivery(self):
         for delivered in (False, True):
             with self.subTest(delivered=delivered):
-                self.store = SignalStore(clock=self.clock, poll_seconds=0)
+                self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=0)
                 self.register()
                 action_id = self.action()["action"]["action_id"]
                 if delivered:
@@ -246,7 +299,7 @@ class SignalStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.status("other", old_id)["action"])
 
     def test_closed_session_receipt_window_expires_and_history_is_bounded(self):
-        self.store = SignalStore(clock=self.clock, poll_seconds=0, max_previous_sessions=1)
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=0, max_previous_sessions=1)
         self.register()
         old_session, old_token = self.session, self.token
         old_id = self.action()["action"]["action_id"]
@@ -306,7 +359,7 @@ class SignalStoreTests(unittest.TestCase):
         self.assertNotIn(self.token, json.dumps(self.store.status(self.room)))
 
     def test_action_cap_does_not_evict_deduplication_ids(self):
-        self.store = SignalStore(clock=self.clock, poll_seconds=0, max_actions=2)
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=0, max_actions=2)
         self.register()
         completed = []
         for _ in range(2):
@@ -322,7 +375,7 @@ class SignalStoreTests(unittest.TestCase):
         self.assertEqual(self.action()["action"]["status"], "accepted")
 
     def test_room_store_bounded_and_active_receivers_never_evicted(self):
-        self.store = SignalStore(clock=self.clock, poll_seconds=0, max_rooms=2)
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=0, max_rooms=2)
         self.register()
         self.store.register("other")
         self.assert_error("signal_capacity_reached", self.store.register, "third")
@@ -331,7 +384,7 @@ class SignalStoreTests(unittest.TestCase):
         self.assertEqual(len(self.store.rooms), 2)
 
     def test_room_capacity_cannot_evict_an_inflight_receipt(self):
-        self.store = SignalStore(clock=self.clock, poll_seconds=0, max_rooms=1)
+        self.store = SignalStore(clock=self.clock, lease_seconds=6, action_seconds=5, receipt_seconds=10, poll_seconds=0, max_rooms=1)
         self.register()
         action_id = self.action()["action"]["action_id"]
         self.poll()

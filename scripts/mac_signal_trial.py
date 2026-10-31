@@ -91,7 +91,7 @@ class ActionConsumer:
             return None
         self.seen.add(action_id)
         remaining = action["remaining_ms"]
-        if type(remaining) not in {int, float} or not math.isfinite(remaining) or not 0 < remaining <= 5000:
+        if type(remaining) not in {int, float} or not math.isfinite(remaining) or not 0 < remaining <= 10000:
             return (action_id, "cancelled", "expired")
         # Subtract ALL request time, including server wait: a conservative bound
         # without trusting synchronization between the Mac and VPS clocks.

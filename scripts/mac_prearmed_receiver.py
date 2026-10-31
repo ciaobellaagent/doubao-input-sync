@@ -106,6 +106,21 @@ def valid_hash(value):
     return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
+def poll_budget_start(response, started, received):
+    """Remove only measured server wait from the conservative request debit.
+
+    The server's remaining_ms is sampled AFTER its long poll has waited. That
+    wait is already reflected in the returned action budget. All other request
+    time and subsequent local queue/lock time must still consume authorization.
+    Old servers and invalid timing metadata retain the original full debit.
+    """
+    wait = response.get("poll_wait_ms")
+    elapsed_ms = (received - started) * 1000
+    if type(wait) is int and 0 <= wait <= 1000 and wait <= elapsed_ms:
+        return started + wait / 1000
+    return started
+
+
 def acknowledge_result(api, receipt, stopped=lambda: False):
     """Retry the fixed receipt only; this function cannot execute an action."""
     for attempt in range(2):
@@ -511,12 +526,16 @@ def receive(api, room, stop_event, duration=0, relay_timeout=6.0):
                         if action_id not in submitted and action_id not in pending:
                             # Preserve the first conservative deadline even when
                             # another action's ACK is slow. No poll is discarded.
+                            budget_started = poll_budget_start(response, started, received_at)
+                            waited_ms = (budget_started - started) * 1000
                             remaining = action.get("remaining_ms")
                             trace("action_received", action_id=action_id,
                                   poll_ms=(received_at - started) * 1000, server_remaining_ms=remaining,
-                                  remaining_ms=(remaining - (received_at - started) * 1000)
+                                  poll_wait_ms=waited_ms,
+                                  request_overhead_ms=(received_at - budget_started) * 1000,
+                                  remaining_ms=(remaining - (received_at - budget_started) * 1000)
                                   if type(remaining) in {int, float} else None)
-                            pending[action_id] = (action, started, received_at)
+                            pending[action_id] = (action, budget_started, received_at)
                     if job and job.done():
                         job.result()
                         job = None

@@ -308,6 +308,15 @@ class SignalStore:
             session.polling = True
             # A real monotonic deadline bounds waits even in fake-clock unit tests.
             deadline = time.monotonic() + self.poll_seconds
+            poll_wait_ns = 0
+            max_poll_wait_ms = min(1000, max(0, math.floor(self.poll_seconds * 1000)))
+
+            def poll_wait_ms() -> int:
+                # Credit only observed Condition.wait time, rounded down and
+                # bounded by this endpoint's long-poll allowance. Clients still
+                # deduct transport, parsing, local queueing and execution time.
+                return min(poll_wait_ns // 1_000_000, max_poll_wait_ms)
+
             try:
                 while True:
                     self._receiver(room, session_id, token)
@@ -319,7 +328,7 @@ class SignalStore:
                             # The original deadline still bounds dispatch on the
                             # receiver. This allowance accepts results only.
                             action.receipt_deadline = action.deadline + self.receipt_seconds
-                            return {"ok": True, "session_id": session_id, "action": {
+                            return {"ok": True, "session_id": session_id, "poll_wait_ms": poll_wait_ms(), "action": {
                                 "action_id": action.action_id, "session_id": session_id,
                                 "remaining_ms": remaining_ms,
                                 **({"preparation_id": action.preparation_id, "sha256": action.sha256}
@@ -329,12 +338,14 @@ class SignalStore:
                         session.outstanding_id = None
                     preparation = session.preparation
                     if preparation is not None and not preparation.ready and session.outstanding_id is None:
-                        return {"ok": True, "session_id": session_id, "action": None,
+                        return {"ok": True, "session_id": session_id, "poll_wait_ms": poll_wait_ms(), "action": None,
                                 "preparation": preparation.public(self.clock())}
                     remaining_wait = deadline - time.monotonic()
                     if remaining_wait <= 0:
-                        return {"ok": True, "session_id": session_id, "action": None}
+                        return {"ok": True, "session_id": session_id, "poll_wait_ms": poll_wait_ms(), "action": None}
+                    wait_started_ns = time.monotonic_ns()
                     self.changed.wait(remaining_wait)
+                    poll_wait_ns += max(0, time.monotonic_ns() - wait_started_ns)
             finally:
                 session.polling = False
                 if session.active and self.rooms.get(room) is session:

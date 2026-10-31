@@ -137,6 +137,32 @@ class MatchTests(unittest.TestCase):
         self.assertEqual(self.consumer.consume(self.action, 11)[1:], ("executed", None))
         self.paste.assert_called_once_with(16, self.prep["sha256"])
 
+    def test_server_wait_is_not_debited_twice_but_transport_and_queue_still_are(self):
+        # Request: t=10..11.5, including exactly 1s of server wait. Execution
+        # starts at t=12, so both 0.5s request overhead and 0.5s local queue count.
+        start = receiver.poll_budget_start({"poll_wait_ms": 1000}, 10, 11.5)
+        self.assertEqual(self.consumer.consume(self.action, start)[1:], ("executed", None))
+        self.paste.assert_called_once_with(16, self.prep["sha256"])
+
+    def test_old_server_keeps_original_conservative_deadline(self):
+        start = receiver.poll_budget_start({}, 10, 11.5)
+        self.assertEqual(self.consumer.consume(self.action, start)[1:], ("executed", None))
+        self.paste.assert_called_once_with(15, self.prep["sha256"])
+
+    def test_invalid_server_wait_cannot_increase_the_budget(self):
+        for value in (True, -1, 1001, 1000.0, "1000", None, float("inf"), float("nan")):
+            with self.subTest(value=value):
+                self.assertEqual(receiver.poll_budget_start({"poll_wait_ms": value}, 10, 11.5), 10)
+        self.assertEqual(receiver.poll_budget_start({"poll_wait_ms": 600}, 10, 10.5), 10)
+
+    def test_server_wait_correction_does_not_renew_delayed_or_duplicate_actions(self):
+        start = receiver.poll_budget_start({"poll_wait_ms": 1000}, 10, 11.5)
+        self.consumer.monotonic = lambda: 16.1
+        result = self.consumer.consume(self.action, start)
+        self.assertEqual(result[1:], ("cancelled", "expired"))
+        self.assertEqual(self.consumer.consume(self.action, 100), result)
+        self.paste.assert_not_called()
+
     def test_duplicate_returns_original_ack_without_repaste(self):
         result = self.consumer.consume(self.action, 11)
         self.assertEqual(self.consumer.consume(self.action, 11), result)
@@ -177,6 +203,53 @@ class MatchTests(unittest.TestCase):
         self.paste.side_effect = lambda *_: "executed" if self.lock.locked() else "paste_failed"
         self.assertEqual(self.consumer.consume(self.action, 11)[1], "executed")
         self.assertFalse(self.lock.locked())
+
+
+class PollBudgetWireTests(unittest.TestCase):
+    def test_real_http_wait_credit_reaches_consumer_and_duplicate_never_repastes(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import test_signal_trial as backend
+        fixture = backend.SignalApiTests("runTest")
+        fixture.setUp()
+        fixture.httpd.signal_store.poll_seconds = 1
+        store = fixture.httpd.signal_store
+        api = receiver.ControlApi("http://127.0.0.1:" + str(fixture.httpd.server_port) + "/doubao")
+        registration = api.request("register", {"room_id": "generated-room", "protocol": receiver.PROTOCOL})
+        identity = {"room_id": "generated-room", "session_id": registration["session_id"],
+                    "receiver_token": registration["receiver_token"]}
+        fingerprint, preparation_id, action_id = "a" * 64, str(uuid4()), str(uuid4())
+        preparation = {"preparation_id": preparation_id, "sha256": fingerprint}
+        entered = threading.Event()
+        original_wait = store.changed.wait
+        def wait(timeout):
+            entered.set()
+            return original_wait(timeout)
+        try:
+            api.request("prepare", {"room_id": "generated-room", "session_id": identity["session_id"], **preparation})
+            api.request("prepared", {**identity, "preparation_id": preparation_id})
+            with patch.object(store.changed, "wait", side_effect=wait), ThreadPoolExecutor(max_workers=1) as pool:
+                started = time.monotonic()
+                pending = pool.submit(api.request, "poll", identity)
+                self.assertTrue(entered.wait(3))
+                time.sleep(0.02)  # Ensure at least one measured millisecond of real long-poll wait.
+                api.request("action", {"room_id": "generated-room", "session_id": identity["session_id"],
+                                       "preparation_id": preparation_id, "action_id": action_id})
+                response = pending.result(timeout=4)
+                received = time.monotonic()
+            self.assertGreater(response["poll_wait_ms"], 0)
+            start = receiver.poll_budget_start(response, started, received)
+            self.assertAlmostEqual(start - started, response["poll_wait_ms"] / 1000)
+            paste = Mock(return_value="executed")
+            consumer = receiver.MatchConsumer(identity["session_id"], Mock(), paste, threading.Lock())
+            self.assertTrue(consumer.prepare(preparation))
+            result = consumer.consume(response["action"], start)
+            self.assertEqual(result[1:], ("executed", None))
+            self.assertLessEqual(paste.call_args.args[0], received + 5)
+            self.assertEqual(api.request("ack", {**identity, "action_id": action_id, "status": "executed"})["action"]["status"], "executed")
+            self.assertEqual(consumer.consume(response["action"], received + 100), result)
+            paste.assert_called_once()
+        finally:
+            fixture.tearDown()
 
 
 class WatcherTests(unittest.TestCase):

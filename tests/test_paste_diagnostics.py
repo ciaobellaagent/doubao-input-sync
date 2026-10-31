@@ -98,16 +98,20 @@ class PasteDiagnosticsTests(unittest.TestCase):
 
     def test_numbers_are_finite_bounded_and_never_booleans(self):
         fields = {"elapsed_ms": math.nan, "poll_ms": math.inf, "queue_ms": -1,
+                  "poll_wait_ms": True, "request_overhead_ms": -1,
                   "lock_ms": True, "remaining_ms": -600001, "server_remaining_ms": 600001,
                   "http_status": 600, "curl_code": -1, "exit_code": 256,
                   "code": 10 ** 1000, "pid": False}
         diagnostics.trace("control", **fields)
         self.assertEqual(set(self.records()[0]), self.base_fields())
         diagnostics.trace("process_end", elapsed_ms=600000, remaining_ms=-123.25,
+                          poll_wait_ms=900, request_overhead_ms=450,
                           http_status=0, curl_code=28, exit_code=-15, code=-25212, pid=123)
         record = self.records()[1]
         self.assertEqual(record["remaining_ms"], -123.25)
         self.assertEqual(record["exit_code"], -15)
+        self.assertEqual(record["poll_wait_ms"], 900)
+        self.assertEqual(record["request_overhead_ms"], 450)
 
     def test_arbitrary_objects_are_not_stringified(self):
         class Private:

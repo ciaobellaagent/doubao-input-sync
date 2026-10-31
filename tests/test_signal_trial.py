@@ -83,6 +83,99 @@ class SignalStoreTests(unittest.TestCase):
         self.assertIsNone(self.poll()["action"])
         self.assert_error("action_in_progress", self.action)
 
+    def test_immediate_poll_has_zero_wait_without_changing_action_fields(self):
+        self.register()
+        response = self.poll()
+        self.assertEqual(response["poll_wait_ms"], 0)
+        action_id = self.action()["action"]["action_id"]
+        deadline = self.store.rooms[self.room].actions[action_id].deadline
+        with patch("app.signal_trial.time.monotonic_ns", side_effect=AssertionError("no wait occurred")):
+            response = self.poll()
+        self.assertEqual(response["poll_wait_ms"], 0)
+        self.assertEqual(set(response["action"]), {"action_id", "session_id", "remaining_ms"})
+        self.assertEqual(response["action"]["remaining_ms"], 5000)
+        self.assertEqual(self.store.rooms[self.room].actions[action_id].deadline, deadline)
+
+    def test_wait_waking_for_a_new_action_credits_only_wait_and_preserves_ttl(self):
+        self.store = SignalStore(clock=self.clock, poll_seconds=1)
+        self.register()
+        action_id = str(uuid4())
+        def notified(_timeout):
+            # The authorization clock is separate from the real-monotonic
+            # wait measurement: a new action starts its own five-second TTL.
+            self.clock.now += 0.725
+            self.action(action_id)
+            return True
+        with patch.object(self.store.changed, "wait", side_effect=notified) as waiting, \
+                patch("app.signal_trial.time.monotonic", return_value=20.0), \
+                patch("app.signal_trial.time.monotonic_ns", side_effect=[10_000_000_000, 10_725_999_999]):
+            response = self.poll()
+        self.assertEqual(waiting.call_count, 1)
+        self.assertEqual(response["poll_wait_ms"], 725)
+        self.assertEqual(response["action"]["remaining_ms"], 5000)
+        action = self.store.rooms[self.room].actions[action_id]
+        self.assertEqual(action.deadline, self.clock.now + 5)
+        self.assertEqual(action.receipt_deadline, action.deadline + self.store.receipt_seconds)
+        self.assertEqual(action.status, "delivered")
+        # Neither readback nor the result-only receipt allowance repeats it.
+        self.assertIsNone(self.poll()["action"])
+
+    def test_spurious_waits_accumulate_before_flooring_and_respect_both_caps(self):
+        for allowance, expected in ((1.0, 1000), (0.25, 250)):
+            with self.subTest(allowance=allowance):
+                self.store = SignalStore(clock=self.clock, poll_seconds=allowance)
+                self.register()
+                action_id = str(uuid4())
+                count = 0
+                def spurious(_timeout):
+                    nonlocal count
+                    count += 1
+                    if count == 3:
+                        self.action(action_id)
+                    return True
+                # Three observed waits total 1.2s. Ignore scheduling/processing
+                # gaps between waits; cap the credit even if waits oversleep.
+                measurements = [0, 400_999_999, 900_000_000, 1_300_999_999,
+                                1_800_000_000, 2_200_999_999]
+                with patch.object(self.store.changed, "wait", side_effect=spurious), \
+                        patch("app.signal_trial.time.monotonic", return_value=30.0), \
+                        patch("app.signal_trial.time.monotonic_ns", side_effect=measurements):
+                    response = self.poll()
+                self.assertEqual(count, 3)
+                self.assertEqual(response["poll_wait_ms"], expected)
+                self.assertEqual(response["action"]["remaining_ms"], 5000)
+        # Fractional milliseconds accumulate before rounding; three individual
+        # waits shorter than 1ms are not each rounded away.
+        self.store = SignalStore(clock=self.clock, poll_seconds=1)
+        self.register()
+        action_id = str(uuid4())
+        count = 0
+        def tiny_spurious(_timeout):
+            nonlocal count
+            count += 1
+            if count == 3:
+                self.action(action_id)
+            return True
+        with patch.object(self.store.changed, "wait", side_effect=tiny_spurious), \
+                patch("app.signal_trial.time.monotonic", return_value=40.0), \
+                patch("app.signal_trial.time.monotonic_ns", side_effect=[0, 600_000, 800_000, 1_400_000,
+                                                                       1_500_000, 2_100_000]):
+            response = self.poll()
+        self.assertEqual(response["poll_wait_ms"], 1)
+
+    def test_timed_out_empty_poll_reports_observed_wait_without_changing_lease_rules(self):
+        self.store = SignalStore(clock=self.clock, poll_seconds=0.25)
+        self.register()
+        with patch.object(self.store.changed, "wait", return_value=False) as waiting, \
+                patch("app.signal_trial.time.monotonic", side_effect=[50.0, 50.0, 50.3]), \
+                patch("app.signal_trial.time.monotonic_ns", side_effect=[0, 249_999_999]):
+            response = self.poll()
+        self.assertEqual(waiting.call_count, 1)
+        self.assertEqual(response, {"ok": True, "session_id": self.session,
+                                    "poll_wait_ms": 249, "action": None})
+        self.assertEqual(self.store.rooms[self.room].last_poll_completed, self.clock.now)
+        self.assertEqual(self.store.rooms[self.room].actions, {})
+
     def test_duplicate_posts_and_ack_are_idempotent(self):
         self.register()
         accepted = self.action()
@@ -264,7 +357,13 @@ class SignalStoreTests(unittest.TestCase):
                 self.fail("long poll did not start")
             self.assert_error("poll_in_progress", self.poll)
             action_id = self.action()["action"]["action_id"]
-            self.assertEqual(waiting.result(timeout=2)["action"]["action_id"], action_id)
+            original_deadline = self.store.rooms[self.room].actions[action_id].deadline
+            response = waiting.result(timeout=2)
+            self.assertEqual(response["action"]["action_id"], action_id)
+            self.assertIs(type(response["poll_wait_ms"]), int)
+            self.assertLessEqual(response["poll_wait_ms"], 1000)
+            self.assertGreaterEqual(response["poll_wait_ms"], 0)
+            self.assertEqual(self.store.rooms[self.room].actions[action_id].deadline, original_deadline)
             self.store.ack(self.room, self.session, self.token, action_id, "executed")
             waiting = pool.submit(self.poll)
             self.store.unregister(self.room, self.session, self.token)
@@ -293,7 +392,9 @@ class ClipboardMatchTests(unittest.TestCase):
 
     def test_preparation_never_authorizes_action_and_only_receiver_can_ready(self):
         self.match_session()
-        self.assertIsNone(self.poll()["action"])
+        response = self.poll()
+        self.assertIsNone(response["action"])
+        self.assertEqual(response["poll_wait_ms"], 0)
         self.assertEqual(self.poll()["preparation"]["sha256"], self.sha)
         self.assertFalse(self.store.status(self.room)["preparation"]["ready"])
         self.assert_error("receiver_token_invalid", self.store.prepared,

@@ -68,7 +68,7 @@ STAGES = frozenset({
     "as_legacy_lookup", "as_process_lookup", "as_bundle_lookup", "as_focused_input",
     "as_focused_window", "as_input_role", "as_focus_ready", "as_clipboard_wait",
     "as_clipboard_matched", "as_dispatch_intent", "as_dispatch_returned",
-    "as_native_handoff",
+    "as_native_handoff", "as_target_capture",
 })
 
 _ENUM_FIELDS = {
@@ -81,7 +81,7 @@ _ENUM_FIELDS = {
     "termination": frozenset({"exit", "deadline", "stop", "spawn_error"}),
     "error_code": ERROR_CODES,
 }
-_TIMING_FIELDS = frozenset({"elapsed_ms", "poll_ms", "queue_ms", "lock_ms"})
+_TIMING_FIELDS = frozenset({"elapsed_ms", "poll_ms", "queue_ms", "lock_ms", "poll_wait_ms", "request_overhead_ms"})
 _REMAINING_FIELDS = frozenset({"remaining_ms", "server_remaining_ms"})
 _INTEGER_FIELDS = {
     "http_status": (0, 599),

@@ -24,10 +24,13 @@ on run argv
     end if
     try
         if my nowMs() ≥ deadlineMs then return "expired"
+        -- Entry precedes target capture / System Events lookups so a slow
+        -- process launch can be distinguished from a slow automation read.
+        my progress("as_start", 0)
         tell application "System Events"
             set diagnosticStage to "target_process"
+            my progress("as_target_capture", 0)
             set targetPid to my frontmostPid()
-            my progress("as_start", 0)
             my recordFailure("workspace_target_pid", targetPid)
             -- NSWorkspace already selected the authoritative PID. Avoid a
             -- second, diagnostic-only frontmost lookup on the paste deadline.
